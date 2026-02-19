@@ -1,13 +1,13 @@
 import { useEffect, useState, useCallback } from 'react';
-import { getSearchResult } from '../services/api';
-import type { SearchResult } from '../services/api';
+import { getSearchResult, postMoreLeads } from '../services/api';
+import type { SearchResult, EmailDraft } from '../services/api';
 import { useWebSocket } from '../hooks/useWebSocket';
 import ActivityFeed from '../components/ActivityFeed';
 import ContactCard from '../components/ContactCard';
 
 interface Props {
   jobId: string;
-  onBack: () => void;
+  onBack?: () => void;
 }
 
 const STATUS_LABELS: Record<string, string> = {
@@ -25,24 +25,23 @@ const STEP_ORDER = [
   'finding_people',
   'finding_emails',
   'researching',
-  'generating_emails',
   'completed',
 ];
 
-export default function ResultsPage({ jobId, onBack }: Props) {
+export default function ResultsPage({ jobId }: Props) {
   const [result, setResult] = useState<SearchResult | null>(null);
+  const [moreLeadsLoading, setMoreLeadsLoading] = useState(false);
+  const [moreLeadsError, setMoreLeadsError] = useState<string | null>(null);
   const { data: wsData } = useWebSocket(jobId);
 
-  // Prefer WebSocket data, fall back to polling
   const displayResult = wsData || result;
 
-  // Polling fallback
   const poll = useCallback(async () => {
     try {
       const data = await getSearchResult(jobId);
       setResult(data);
     } catch {
-      // ignore polling errors
+      // ignore
     }
   }, [jobId]);
 
@@ -54,8 +53,8 @@ export default function ResultsPage({ jobId, onBack }: Props) {
 
   if (!displayResult) {
     return (
-      <div className="min-h-screen bg-gray-950 text-white flex items-center justify-center">
-        <div className="animate-pulse text-gray-400">Loading...</div>
+      <div className="flex items-center justify-center py-24">
+        <div className="animate-pulse text-gray-400 text-sm">Loading…</div>
       </div>
     );
   }
@@ -65,7 +64,6 @@ export default function ResultsPage({ jobId, onBack }: Props) {
   const stepIndex = STEP_ORDER.indexOf(status);
   const progress = Math.max(0, Math.min(100, (stepIndex / (STEP_ORDER.length - 1)) * 100));
 
-  // Match email results and drafts to people by name
   function getEmailForPerson(name: string) {
     return displayResult!.email_results.find((e) => e.name === name);
   }
@@ -73,76 +71,106 @@ export default function ResultsPage({ jobId, onBack }: Props) {
     return displayResult!.email_drafts.find((d) => d.name === name);
   }
 
+  function handleEmailGenerated(newDraft: EmailDraft) {
+    setResult((prev) =>
+      prev
+        ? { ...prev, email_drafts: [...prev.email_drafts, newDraft] }
+        : null
+    );
+  }
+
+  async function handleGenerateMoreLeads() {
+    setMoreLeadsError(null);
+    setMoreLeadsLoading(true);
+    try {
+      await postMoreLeads(jobId);
+    } catch (e) {
+      setMoreLeadsError(e instanceof Error ? e.message : 'Failed to start');
+    } finally {
+      setMoreLeadsLoading(false);
+    }
+  }
+
   return (
-    <div className="min-h-screen bg-gray-950 text-white">
-      <div className="max-w-3xl mx-auto px-4 py-8 space-y-6">
-        {/* Header */}
-        <div className="flex items-center justify-between">
-          <div>
+    <div className="max-w-3xl space-y-6">
+      {/* Title + status + more leads */}
+      <div className="flex items-center justify-between gap-4 flex-wrap">
+        <h2 className="text-xl font-semibold text-gray-900 truncate">
+          {displayResult.company} — {displayResult.role}
+        </h2>
+        <div className="flex items-center gap-2 shrink-0">
+          {status === 'completed' && (
             <button
-              onClick={onBack}
-              className="text-sm text-gray-500 hover:text-gray-300 mb-2 cursor-pointer"
+              type="button"
+              onClick={handleGenerateMoreLeads}
+              disabled={moreLeadsLoading}
+              className="text-sm font-medium text-gray-700 bg-white border border-gray-200 rounded-lg px-3 py-1.5 hover:bg-gray-50 disabled:opacity-50 disabled:pointer-events-none"
             >
-              &larr; New search
+              {moreLeadsLoading ? 'Finding more…' : 'Generate more leads'}
             </button>
-            <h1 className="text-2xl font-bold">
-              {displayResult.company} &mdash; {displayResult.role}
-            </h1>
-          </div>
-          <span className={`text-sm px-3 py-1 rounded-full border ${
-            status === 'completed' ? 'border-green-700 text-green-400' :
-            status === 'failed' ? 'border-red-700 text-red-400' :
-            'border-blue-700 text-blue-400'
-          }`}>
+          )}
+          <span
+            className={`text-xs font-medium px-2.5 py-1 rounded-full border ${
+              status === 'completed'
+                ? 'border-green-200 text-green-700 bg-green-50'
+                : status === 'failed'
+                  ? 'border-red-200 text-red-700 bg-red-50'
+                  : 'border-gray-200 text-gray-700 bg-gray-50'
+            }`}
+          >
             {STATUS_LABELS[status] || status}
           </span>
         </div>
+      </div>
+      {moreLeadsError && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-2 text-sm text-red-700">
+          {moreLeadsError}
+        </div>
+      )}
 
-        {/* Progress bar */}
-        {isRunning && (
-          <div className="w-full h-1 bg-gray-800 rounded-full overflow-hidden">
-            <div
-              className="h-full bg-blue-500 rounded-full transition-all duration-500"
-              style={{ width: `${progress}%` }}
-            />
-          </div>
-        )}
+      {/* Progress */}
+      {isRunning && (
+        <div className="h-0.5 w-full bg-gray-100 rounded-full overflow-hidden">
+          <div
+            className="h-full bg-gray-900 rounded-full transition-all duration-500"
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+      )}
 
-        {/* Activity feed */}
-        <ActivityFeed entries={displayResult.activity_log} status={status} />
+      <ActivityFeed entries={displayResult.activity_log} status={status} />
 
-        {/* Error */}
-        {displayResult.error && (
-          <div className="rounded-xl bg-red-950/30 border border-red-800 p-4 text-red-300 text-sm">
-            {displayResult.error}
-          </div>
-        )}
+      {displayResult.error && (
+        <div className="rounded-lg border border-red-200 bg-red-50 px-4 py-3 text-sm text-red-700">
+          {displayResult.error}
+        </div>
+      )}
 
-        {/* Results */}
-        {displayResult.people.length > 0 && (
-          <div className="space-y-3">
-            <h2 className="text-lg font-semibold text-gray-200">
-              Contacts ({displayResult.people.length})
-            </h2>
+      {displayResult.people.length > 0 && (
+        <div className="space-y-3">
+          <h3 className="text-sm font-medium text-gray-500">
+            Contacts ({displayResult.people.length})
+          </h3>
+          <div className="space-y-2">
             {displayResult.people.map((person) => (
               <ContactCard
-                key={person.name}
+                key={person.linkedin_url || person.name}
                 person={person}
                 emailResult={getEmailForPerson(person.name)}
                 draft={getDraftForPerson(person.name)}
                 jobId={jobId}
+                onEmailGenerated={handleEmailGenerated}
               />
             ))}
           </div>
-        )}
+        </div>
+      )}
 
-        {/* Empty state */}
-        {status === 'completed' && displayResult.people.length === 0 && (
-          <div className="text-center py-12 text-gray-500">
-            No contacts found. Try a different company or role.
-          </div>
-        )}
-      </div>
+      {status === 'completed' && displayResult.people.length === 0 && (
+        <div className="py-12 text-center text-sm text-gray-500">
+          No contacts found. Try a different company or role.
+        </div>
+      )}
     </div>
   );
 }

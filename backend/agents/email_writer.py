@@ -168,6 +168,7 @@ async def generate_single_email(
     role: str,
     user_info: str = "",
     previous_openings: list[str] | None = None,
+    job_context: dict | None = None,
 ) -> EmailDraft:
     """Generate a personalized cold email for one contact.
 
@@ -210,6 +211,20 @@ async def generate_single_email(
     else:
         recipient_type = "Engineer"
 
+    job_block = ""
+    if job_context and any(job_context.get(k) for k in ("team", "tech_stack", "key_requirements")):
+        team = job_context.get("team", "")
+        tech = job_context.get("tech_stack", [])
+        reqs = job_context.get("key_requirements", [])
+        job_block = (
+            f"\nThe sender is applying for this specific role (use to make the email specific):\n"
+            f"- Team: {team}\n"
+            f"- Key tech: {tech}\n"
+            f"- What the role involves: {reqs}\n"
+            "For engineers, mention shared tech stack interest. For recruiters, reference the exact posting. "
+            "For managers, show you understand what their team builds.\n\n"
+        )
+
     user_prompt = (
         f"Write a cold outreach email.\n\n"
         f"Sender: A student applying for {role} at {company_context.company}\n"
@@ -217,6 +232,7 @@ async def generate_single_email(
         f"Recipient: {person.name}, {person.title}\n"
         f"Recipient type: {recipient_type}\n"
         f"Their LinkedIn snippet: {person.profile_summary[:300] if person.profile_summary else 'Not available'}\n\n"
+        f"{job_block}"
         f"Company context:\n"
         f"- Mission: {company_context.mission}\n"
         f"- Recent news: {company_context.recent_news}\n"
@@ -273,6 +289,7 @@ async def generate_batch_emails(
     company_context: CompanyContext,
     role: str,
     user_info: str = "",
+    job_context: dict | None = None,
 ) -> list[EmailDraft]:
     """Generate personalized emails for all contacts with variety enforcement.
 
@@ -312,6 +329,7 @@ async def generate_batch_emails(
             role=role,
             user_info=user_info,
             previous_openings=previous_openings if previous_openings else None,
+            job_context=job_context,
         )
 
         # Track the opening line for variety enforcement

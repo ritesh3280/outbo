@@ -10,6 +10,7 @@ class SearchRequest(BaseModel):
     resume_url: Optional[str] = None
     linkedin_url: Optional[str] = None
     company_website: Optional[str] = None
+    job_url: Optional[str] = None
 
 
 class Person(BaseModel):
@@ -72,3 +73,7 @@ class SearchResult(BaseModel):
     email_drafts: list[EmailDraft] = []
     activity_log: list[ActivityLogEntry] = []
     error: Optional[str] = None
+    # Stored for on-demand email generation (not sent to client in some flows if desired)
+    company_context: Optional[dict] = None
+    job_context: Optional[dict] = None
+    user_info: Optional[str] = None

@@ -42,10 +42,29 @@ Return a JSON array of objects, one per person, in the same order: [{"name": "..
 """
 
 
+def _scoring_system_prompt(job_context: dict | None) -> str:
+    """Base prompt; when job_context provided, add role-specific context."""
+    base = SCORING_SYSTEM_PROMPT
+    if not job_context or not any(job_context.get(k) for k in ("team", "department", "tech_stack")):
+        return base
+    return base + """
+
+When job context is provided below, use it to rank by relevance to THIS specific role:
+- Recruiter who handles this department → 90-100
+- Engineer ON this exact team → 80-95
+- Engineer using the same tech stack → 70-85
+- Engineering manager of this team → 75-90
+- General recruiter → 60-75
+- Engineer on a different team → 30-50
+- Unrelated department → 0-10
+"""
+
+
 async def score_people(
     people: list[Person],
     role: str,
     company: str,
+    job_context: dict | None = None,
 ) -> list[Person]:
     """Score each person on relevance for the given role.
 
@@ -53,6 +72,7 @@ async def score_people(
         people: List of Person objects to score.
         role: The role being applied for.
         company: The target company.
+        job_context: Optional dict from job_analyzer (team, department, tech_stack, etc.).
 
     Returns:
         List of Person objects with priority_score and priority_reason populated,
@@ -77,9 +97,21 @@ async def score_people(
         for p in people
     ]
 
-    user_prompt = (
+    role_block = (
         f"Company: {company}\n"
         f"Role being applied for: {role}\n\n"
+    )
+    if job_context and any(job_context.get(k) for k in ("team", "department", "tech_stack", "key_requirements")):
+        role_block += (
+            "ROLE CONTEXT (from job posting):\n"
+            f"- Team: {job_context.get('team', '')}\n"
+            f"- Department: {job_context.get('department', '')}\n"
+            f"- Tech stack: {job_context.get('tech_stack', [])}\n"
+            f"- Key requirements: {job_context.get('key_requirements', [])}\n\n"
+        )
+
+    user_prompt = (
+        f"{role_block}"
         f"People to score:\n{json.dumps(people_data, indent=2)}\n\n"
         f"Return a JSON array of objects, one per person, in the same order. Use score 0-100:\n"
         f'[{{"name": "...", "score": 85, "reason": "..."}}]'
@@ -89,7 +121,7 @@ async def score_people(
         response = await client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[
-                {"role": "system", "content": SCORING_SYSTEM_PROMPT},
+                {"role": "system", "content": _scoring_system_prompt(job_context)},
                 {"role": "user", "content": user_prompt},
             ],
             temperature=0.3,

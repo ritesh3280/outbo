@@ -10,3 +10,5 @@ browser-use-sdk
 firecrawl-py
 dnspython
 langfuse
+motor
+certifi

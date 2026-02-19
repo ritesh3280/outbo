@@ -12,6 +12,7 @@ export async function startSearch(params: {
   resume_url?: string;
   linkedin_url?: string;
   company_website?: string;
+  job_url?: string;
 }): Promise<{ job_id: string }> {
   const response = await fetch(`${API_BASE}/api/search`, {
     method: 'POST',
@@ -25,6 +26,28 @@ export async function startSearch(params: {
 export async function getSearchResult(jobId: string): Promise<SearchResult> {
   const response = await fetch(`${API_BASE}/api/search/${jobId}`);
   if (!response.ok) throw new Error(`Fetch failed: ${response.status}`);
+  return response.json();
+}
+
+/** Start finding more contacts for this campaign (excludes existing). Returns when started (202). */
+export async function postMoreLeads(jobId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/search/${jobId}/more-leads`, {
+    method: 'POST',
+  });
+  if (response.status === 409) throw new Error('Campaign must be completed first');
+  if (!response.ok) throw new Error(`More leads failed: ${response.status}`);
+}
+
+export async function generateEmail(params: {
+  job_id: string;
+  name: string;
+}): Promise<EmailDraft> {
+  const response = await fetch(`${API_BASE}/api/email/generate`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!response.ok) throw new Error(`Generate failed: ${response.status}`);
   return response.json();
 }
 

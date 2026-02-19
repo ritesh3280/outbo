@@ -12,7 +12,8 @@ from typing import Any
 
 from backend.models.schemas import (
     ActivityLogEntry,
-    Person,
+    EmailConfidence,
+    EmailResult,
     SearchRequest,
     SearchResult,
     SearchStatus,
@@ -21,7 +22,9 @@ from backend.tools.browser import BrowserTool
 from backend.tools.scraper import ScraperTool
 from backend.agents.people_finder import PeopleFinder
 from backend.agents.email_finder import EmailFinder
-from backend.agents.email_writer import research_company, generate_batch_emails
+from backend.tools.scraper import ScraperTool
+from backend.agents.email_writer import research_company
+from backend.agents.job_analyzer import analyze_job_posting
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +70,17 @@ async def run_search(
 
     browser = BrowserTool()
     scraper = ScraperTool()
+    job_context = None
+
+    if request.job_url:
+        result.status = SearchStatus.FINDING_PEOPLE
+        await update("Analyzing job posting...")
+        try:
+            job_context = await analyze_job_posting(url=request.job_url, scraper=scraper)
+            await update("Job posting analyzed — targeting specific team and role")
+        except Exception as e:
+            logger.warning("Job posting analysis failed: %s", e)
+            await update(f"Could not analyze job posting: {e}", "error")
 
     # ── Step 1: Find people ──────────────────────────────────────────
     result.status = SearchStatus.FINDING_PEOPLE
@@ -78,6 +92,7 @@ async def run_search(
             company=request.company,
             role=request.role,
             target_count=8,
+            job_context=job_context,
         )
         result.people = people
         await update(f"Found {len(people)} contacts", "person_found")
@@ -123,37 +138,97 @@ async def run_search(
         logger.error("Company research failed: %s", e)
         await update(f"Error researching company: {e}", "error")
 
-    # ── Step 4: Generate emails ──────────────────────────────────────
-    if result.email_results and company_context:
-        result.status = SearchStatus.GENERATING_EMAILS
-        await update("Generating personalized emails...")
+    # Build user_info for on-demand email generation
+    user_info = ""
+    if request.resume_url:
+        user_info += f"Resume: {request.resume_url}\n"
+    if request.linkedin_url:
+        user_info += f"LinkedIn: {request.linkedin_url}\n"
 
-        try:
-            user_info = ""
-            if request.resume_url:
-                user_info += f"Resume: {request.resume_url}\n"
-            if request.linkedin_url:
-                user_info += f"LinkedIn: {request.linkedin_url}\n"
+    result.company_context = company_context.model_dump() if company_context else None
+    result.job_context = job_context
+    result.user_info = user_info
 
-            drafts = await generate_batch_emails(
-                people=result.people,
-                email_results=result.email_results,
-                company_context=company_context,
-                role=request.role,
-                user_info=user_info,
-            )
-            result.email_drafts = drafts
-            await update(f"Generated {len(drafts)} personalized emails", "email_drafted")
-        except Exception as e:
-            logger.error("Email generation failed: %s", e)
-            await update(f"Error generating emails: {e}", "error")
-
-    # ── Done ─────────────────────────────────────────────────────────
+    # ── Done (emails generated on demand when user clicks "Generate email") ─
     result.status = SearchStatus.COMPLETED
-    await update("Search complete!", "complete")
+    await update("Search complete! Generate an email for any contact when ready.", "complete")
 
     logger.info(
-        "[%s] Pipeline complete: %d people, %d emails, %d drafts",
-        job_id, len(result.people), len(result.email_results), len(result.email_drafts),
+        "[%s] Pipeline complete: %d people, %d emails (drafts on demand)",
+        job_id, len(result.people), len(result.email_results),
     )
     return result
+
+
+async def run_more_leads(
+    result: SearchResult,
+    on_update: Callable[..., Any] | None = None,
+) -> None:
+    """Find more people for an existing campaign and merge them (no duplicates).
+
+    Modifies result in place: appends new people and email_results, updates status and activity_log.
+    Skips anyone we already have (by normalized LinkedIn URL).
+    """
+    async def update(msg: str, msg_type: str = "status") -> None:
+        result.activity_log.append(_log_entry(msg, msg_type))
+        logger.info("[%s] %s", result.job_id, msg)
+        if on_update:
+            try:
+                await on_update(result)
+            except Exception:
+                pass
+
+    exclude_urls = {
+        PeopleFinder._normalize_linkedin_url(p.linkedin_url)
+        for p in result.people
+        if p.linkedin_url
+    }
+
+    result.status = SearchStatus.FINDING_PEOPLE
+    await update("Finding more contacts (excluding existing)...", "status")
+
+    try:
+        finder = PeopleFinder(browser=BrowserTool())
+        new_people = await finder.find_people(
+            company=result.company,
+            role=result.role,
+            target_count=8,
+            job_context=result.job_context,
+            exclude_linkedin_urls=exclude_urls,
+        )
+    except Exception as e:
+        logger.error("More leads people finder failed: %s", e)
+        await update(f"Error finding more people: {e}", "error")
+        result.status = SearchStatus.COMPLETED
+        return
+
+    if not new_people:
+        await update("No new contacts found for this campaign.", "status")
+        result.status = SearchStatus.COMPLETED
+        return
+
+    result.status = SearchStatus.FINDING_EMAILS
+    await update(f"Discovering emails for {len(new_people)} new contacts...")
+
+    try:
+        email_finder = EmailFinder(scraper=ScraperTool())
+        new_email_results = await email_finder.find_emails(
+            new_people,
+            result.company,
+            company_website=None,
+        )
+        result.people.extend(new_people)
+        result.email_results.extend(new_email_results)
+        found_count = sum(1 for er in new_email_results if er.email)
+        await update(f"Added {len(new_people)} contacts ({found_count} with emails)", "email_found")
+    except Exception as e:
+        logger.error("More leads email finder failed: %s", e)
+        result.people.extend(new_people)
+        result.email_results.extend(
+            EmailResult(name=p.name, email="", confidence=EmailConfidence.LOW) for p in new_people
+        )
+        await update(f"Added {len(new_people)} contacts (email discovery had errors)", "email_found")
+
+    result.status = SearchStatus.COMPLETED
+    await update("More leads added. Generate an email for any new contact when ready.", "complete")
+    logger.info("[%s] More leads: added %d people, total %d", result.job_id, len(new_people), len(result.people))

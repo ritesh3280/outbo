@@ -1,1 +1,7 @@
 @import "tailwindcss";
+
+/* Platform: white main bg, minimal */
+body {
+  background-color: #fff;
+  color: #111827;
+}

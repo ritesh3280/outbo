@@ -22,12 +22,14 @@ class Settings(BaseSettings):
     langfuse_secret_key: str = ""
     langfuse_host: str = "https://cloud.langfuse.com"
 
-    # Database
-    database_url: str = "sqlite:///./outreach.db"
+    # Database (MongoDB)
+    mongodb_uri: str = ""
+    mongodb_database: str = "outbo"
 
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",
+        "extra": "ignore",  # ignore old env vars like DATABASE_URL
     }
 
 

@@ -31,6 +31,7 @@ Open http://localhost:5173 — the app will proxy API calls to the backend at :8
 |-------|-----------|
 | Frontend | React + TypeScript + Tailwind CSS v4 |
 | Backend | FastAPI (Python) |
+| Database | MongoDB (optional; in-memory fallback if `MONGODB_URI` not set) |
 | Browser Automation | Browser Use Cloud API |
 | Web Scraping | Firecrawl |
 | Email Sending | AgentMail |
