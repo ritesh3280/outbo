@@ -5,6 +5,7 @@ at a target company for a given role.
 
 Credit budget per search:
   - 2 Browser Use tasks (recruiter search + engineer search, concurrent)
+  - N OpenAI validation calls (one per profile, concurrent, fast model)
   - 1 OpenAI call for priority scoring
 """
 
@@ -13,7 +14,10 @@ import json
 import logging
 import re
 
+from openai import AsyncOpenAI
 from pydantic import BaseModel
+
+from backend.config import settings
 from backend.models.schemas import Person
 from backend.tools.browser import BrowserTool
 from backend.agents.priority_scorer import score_people
@@ -89,6 +93,71 @@ class PeopleFinder:
 
         return self._parse_people_from_output(result.output)
 
+    # ── Validation ───────────────────────────────────────────────────────
+
+    async def _validate_person_works_at_company(
+        self, person: LinkedInPerson, company: str
+    ) -> bool:
+        """Use OpenAI to validate if a person actually works at the company.
+        
+        Catches false positives from search (e.g., people with company name in their name).
+        Returns True if the person works at the company, False otherwise.
+        """
+        if not settings.openai_api_key:
+            return True  # Skip validation in stub mode
+
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        
+        prompt = f"""Given this LinkedIn profile information, does this person currently work at "{company}"?
+
+Name: {person.name}
+Title: {person.title}
+Profile snippet: {person.recent_activity[:300]}
+
+Answer with ONLY "yes" or "no". 
+- Answer "yes" if the title or snippet indicates they work/worked at {company}
+- Answer "no" if they just have a similar name or no clear connection to {company}"""
+
+        try:
+            response = await client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0,
+                max_tokens=5,
+            )
+            answer = response.choices[0].message.content.strip().lower()
+            is_valid = "yes" in answer
+            
+            if not is_valid:
+                logger.info("Filtered out %s (title: %s) - doesn't work at %s", 
+                           person.name, person.title, company)
+            
+            return is_valid
+        except Exception as e:
+            logger.warning("Validation failed for %s: %s", person.name, e)
+            return True  # Default to keeping on error
+
+    async def _filter_valid_people(
+        self, people: list[LinkedInPerson], company: str
+    ) -> list[LinkedInPerson]:
+        """Filter out false positives using OpenAI validation."""
+        if not people:
+            return []
+        
+        logger.info("Validating %d profiles...", len(people))
+        validation_tasks = [
+            self._validate_person_works_at_company(p, company) for p in people
+        ]
+        validations = await asyncio.gather(*validation_tasks)
+        
+        valid_people = [p for p, is_valid in zip(people, validations) if is_valid]
+        filtered_count = len(people) - len(valid_people)
+        
+        if filtered_count > 0:
+            logger.info("Filtered out %d/%d false positives", filtered_count, len(people))
+        
+        return valid_people
+
     # ── Main pipeline ────────────────────────────────────────────────────
 
     async def find_people(
@@ -102,7 +171,7 @@ class PeopleFinder:
         Pipeline (optimized for minimal Browser Use credits):
         1. Two concurrent Google searches (recruiter + engineer) — 2 Browser Use tasks
         2. Interleave + deduplicate
-        3. Firecrawl enrichment (cheap, best-effort, concurrent)
+        3. OpenAI validation to filter false positives (concurrent)
         4. OpenAI priority scoring
         """
         team_keyword = self._extract_team_keyword(role)
@@ -134,6 +203,10 @@ class PeopleFinder:
 
         all_people = self._deduplicate(interleaved)
         logger.info("After interleave + dedup: %d unique people", len(all_people))
+
+        # Step 3.5: Validate people actually work at the company (OpenAI post-filter)
+        all_people = await self._filter_valid_people(all_people, company)
+        logger.info("After validation: %d confirmed employees", len(all_people))
 
         # Trim to target count
         all_people = all_people[:target_count]

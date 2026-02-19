@@ -15,6 +15,7 @@ import logging
 import re
 
 import httpx
+from openai import AsyncOpenAI
 
 from backend.config import settings
 from backend.models.schemas import EmailConfidence, EmailResult, Person
@@ -22,6 +23,60 @@ from backend.tools.scraper import ScraperTool
 from backend.tools.verifier import check_mx_record
 
 logger = logging.getLogger(__name__)
+
+
+async def _select_best_domain_with_openai(
+    company: str, candidates: list[tuple[str, dict[str, str]]]
+) -> str:
+    """Use OpenAI to select the correct company domain from search results.
+    
+    Args:
+        company: Company name
+        candidates: List of (domain, search_result_info) tuples
+    
+    Returns:
+        The best matching domain
+    """
+    if not settings.openai_api_key or len(candidates) == 1:
+        return candidates[0][0]  # Return first if no API key or only one option
+    
+    # Format candidates for OpenAI
+    options_text = "\n".join([
+        f"{i+1}. {domain} - {sr.get('title', '')} - {sr.get('description', '')[:100]}"
+        for i, (domain, sr) in enumerate(candidates)
+    ])
+    
+    prompt = f"""Which domain is the official website for "{company}"?
+
+Search results:
+{options_text}
+
+Return ONLY the number (1, 2, 3, etc.) of the correct domain. Pick the one that is most likely the company's official website, not a directory, news article, or other listing."""
+
+    try:
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            max_tokens=5,
+        )
+        
+        answer = response.choices[0].message.content.strip()
+        # Extract number from response
+        import re
+        match = re.search(r"\d+", answer)
+        if match:
+            idx = int(match.group()) - 1
+            if 0 <= idx < len(candidates):
+                return candidates[idx][0]
+        
+        logger.warning("Failed to parse OpenAI domain selection, using first: %s", answer)
+        return candidates[0][0]
+        
+    except Exception as e:
+        logger.warning("OpenAI domain selection failed: %s, using first candidate", e)
+        return candidates[0][0]
 
 
 _KNOWN_DOMAINS: dict[str, str] = {
@@ -119,13 +174,26 @@ async def discover_company_domain(
         app = FirecrawlApp(api_key=settings.firecrawl_api_key)
         query = f"{company} official company website"
 
-        result = await asyncio.to_thread(app.search, query, limit=3)
+        result = await asyncio.to_thread(app.search, query, limit=5)
 
-        urls: list[str] = []
+        # Extract all search results with titles and URLs
+        search_results: list[dict[str, str]] = []
         if hasattr(result, "web") and result.web:
-            urls = [r.url for r in result.web if r.url]
+            for r in result.web:
+                if r.url:
+                    search_results.append({
+                        "url": r.url,
+                        "title": getattr(r, "title", ""),
+                        "description": getattr(r, "description", ""),
+                    })
         elif isinstance(result, list):
-            urls = [r.url for r in result if hasattr(r, "url") and r.url]
+            for r in result:
+                if hasattr(r, "url") and r.url:
+                    search_results.append({
+                        "url": r.url,
+                        "title": getattr(r, "title", ""),
+                        "description": getattr(r, "description", ""),
+                    })
 
         skip = {"linkedin.com", "wikipedia.org", "glassdoor.com",
                 "crunchbase.com", "bloomberg.com", "techcrunch.com",
@@ -133,38 +201,23 @@ async def discover_company_domain(
                 "yelp.com", "yellowpages.com", "bbb.org", "zoominfo.com",
                 "pitchbook.com", "angel.co", "wellfound.com"}
 
-        # Build keyword set from company name for relevance scoring
-        company_keywords = set(re.sub(r"[^a-z0-9 ]", "", company.lower()).split())
-        company_keywords.discard("inc")
-        company_keywords.discard("llc")
-        company_keywords.discard("corp")
-        company_keywords.discard("ltd")
-        # Remove common location words (NY, CA, etc.) that inflate false matches
-        company_keywords = {w for w in company_keywords if len(w) > 2}
-
-        candidates: list[str] = []
-        for url in urls:
-            match = re.search(r"https?://(?:www\.)?([^/]+)", url)
+        # Extract candidate domains
+        candidates: list[tuple[str, dict[str, str]]] = []
+        for sr in search_results:
+            match = re.search(r"https?://(?:www\.)?([^/]+)", sr["url"])
             if not match:
                 continue
             domain = match.group(1).lower()
             if any(s in domain for s in skip):
                 continue
-            candidates.append(domain)
+            candidates.append((domain, sr))
 
         if not candidates:
             raise ValueError("No usable domains found in search results")
 
-        # Prefer domains that contain at least one company keyword
-        for domain in candidates:
-            if any(kw in domain for kw in company_keywords):
-                logger.info("Discovered domain for %s: %s", company, domain)
-                _domain_cache[company] = domain
-                return domain
-
-        # Fall back to first non-skip domain
-        domain = candidates[0]
-        logger.info("Discovered domain for %s (no keyword match): %s", company, domain)
+        # Use OpenAI to pick the correct domain from candidates
+        domain = await _select_best_domain_with_openai(company, candidates)
+        logger.info("Discovered domain for %s: %s (OpenAI selected)", company, domain)
         _domain_cache[company] = domain
         return domain
 
