@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     # Firecrawl
     firecrawl_api_key: str = ""
 
+    # Serper (Google Search API — cheap, for wide-net people search)
+    serper_api_key: str = ""
+
     # AgentMail
     agentmail_api_key: str = ""
 

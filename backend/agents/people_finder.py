@@ -1,12 +1,9 @@
 """People Finder Agent.
 
-Searches LinkedIn (via Google dorking) to find relevant contacts
-at a target company for a given role.
+Wide-net pipeline (when Serper API key is set):
+  5 Serper queries (~$0.005) → 30–40 candidates → hard filter → validation → scoring → diversity selection → 6–8 contacts.
 
-Credit budget per search:
-  - 2 Browser Use tasks (recruiter search + engineer search, concurrent)
-  - N OpenAI validation calls (one per profile, concurrent, fast model)
-  - 1 OpenAI call for priority scoring
+Fallback (no Serper): 2 Browser Use tasks + validation + scoring.
 """
 
 import asyncio
@@ -20,9 +17,24 @@ from pydantic import BaseModel
 from backend.config import settings
 from backend.models.schemas import Person
 from backend.tools.browser import BrowserTool
+from backend.tools.serper import search as serper_search
 from backend.agents.priority_scorer import score_people
 
 logger = logging.getLogger(__name__)
+
+# ── Hard filter: exclude people who will rarely reply to intern cold emails ───
+
+EXCLUDE_KEYWORDS = {
+    "ceo", "cfo", "cto", "coo", "founder", "co-founder",
+    "president", "vp", "vice president", "director", "head of",
+    "chief", "partner", "general counsel", "controller",
+    "cpa", "cfa", "board member",
+}
+
+EXCLUDE_DEPARTMENTS = {
+    "finance", "accounting", "legal", "compliance",
+    "sales", "marketing", "operations", "supply chain",
+}
 
 
 class LinkedInPerson(BaseModel):
@@ -32,13 +44,106 @@ class LinkedInPerson(BaseModel):
     recent_activity: str = ""
 
 
+def hard_filter(person: LinkedInPerson, role: str) -> bool:
+    """Remove people who are unlikely to reply to intern cold emails. Deterministic, no LLM."""
+    title = person.title.lower()
+    if any(kw in title for kw in EXCLUDE_KEYWORDS):
+        return False
+    if any(dept in title for dept in EXCLUDE_DEPARTMENTS):
+        if "recruit" not in title:
+            return False
+    return True
+
+
+def select_final_contacts(scored_people: list[Person], target: int = 8) -> list[Person]:
+    """Pick final contacts with diversity: at least 2 recruiters, 3 engineers, 1 manager."""
+    scored_people = sorted(scored_people, key=lambda p: p.priority_score, reverse=True)
+
+    selected: list[Person] = []
+    categories: dict[str, int] = {"recruiter": 0, "engineer": 0, "manager": 0}
+    TARGETS = {"recruiter": 2, "engineer": 3, "manager": 1}
+
+    def categorize(title: str) -> str:
+        t = title.lower()
+        if "recruit" in t or "talent" in t:
+            return "recruiter"
+        if "manager" in t or "lead" in t:
+            return "manager"
+        return "engineer"
+
+    for person in scored_people:
+        cat = categorize(person.title)
+        if categories[cat] < TARGETS.get(cat, 0):
+            selected.append(person)
+            categories[cat] += 1
+        if len(selected) >= target:
+            break
+
+    for person in scored_people:
+        if person not in selected and len(selected) < target:
+            selected.append(person)
+
+    return selected
+
+
 class PeopleFinder:
-    """Finds relevant people at a company using Google → LinkedIn + Firecrawl enrichment."""
+    """Finds relevant people at a company. Uses Serper (wide net) when key is set, else Browser Use."""
 
     def __init__(self, browser: BrowserTool | None = None):
         self.browser = browser or BrowserTool()
 
-    # ── Search methods ───────────────────────────────────────────────────
+    # ── Serper: wide net (5 queries, ~$0.005) ──────────────────────────────
+
+    def _serper_queries(self, company: str, team_keyword: str) -> list[str]:
+        """Five targeted queries for 30–40 raw candidates."""
+        return [
+            f'site:linkedin.com/in "at {company}" "university recruiter" OR "campus recruiter" OR "early career recruiter"',
+            f'site:linkedin.com/in "at {company}" "recruiter" OR "talent acquisition"',
+            f'site:linkedin.com/in "at {company}" "{team_keyword}"',
+            f'site:linkedin.com/in "at {company}" "engineering manager" OR "tech lead"',
+            f'site:linkedin.com/in "at {company}" "hiring" OR "intern" OR "internship"',
+        ]
+
+    @staticmethod
+    def _parse_linkedin_from_serper(result) -> LinkedInPerson | None:
+        """Parse one Serper organic result into LinkedInPerson if it's a LinkedIn profile."""
+        link = (result.link or "").strip()
+        if "linkedin.com/in/" not in link:
+            return None
+        title_raw = (result.title or "").strip()
+        snippet = (result.snippet or "").strip()
+        if " | " in title_raw:
+            title_raw = title_raw.split(" | ")[0].strip()
+        parts = [p.strip() for p in title_raw.split(" - ") if p.strip()]
+        name = parts[0] if parts else ""
+        job_title = " - ".join(parts[1:]) if len(parts) > 1 else ""
+        if not name:
+            return None
+        return LinkedInPerson(
+            name=name,
+            title=job_title,
+            linkedin_url=link,
+            recent_activity=snippet,
+        )
+
+    async def search_serper_wide(self, company: str, role: str) -> list[LinkedInPerson]:
+        """Run 5 Serper queries concurrently, return aggregated LinkedIn profiles."""
+        team_keyword = self._extract_team_keyword(role)
+        queries = self._serper_queries(company, team_keyword)
+        logger.info("Running %d Serper queries for %s...", len(queries), company)
+        tasks = [serper_search(q, num=10) for q in queries]
+        results_per_query = await asyncio.gather(*tasks)
+        raw: list[LinkedInPerson] = []
+        for results in results_per_query:
+            for r in results:
+                p = self._parse_linkedin_from_serper(r)
+                if p:
+                    raw.append(p)
+        deduped = self._deduplicate(raw)
+        logger.info("Serper: %d raw → %d unique after dedup", len(raw), len(deduped))
+        return deduped
+
+    # ── Browser Use search (fallback) ─────────────────────────────────────
 
     async def search_google_for_linkedin(
         self, company: str, query: str, max_results: int = 10
@@ -168,31 +273,65 @@ Answer with ONLY "yes" or "no".
     ) -> list[Person]:
         """Find relevant people at a company for a given role.
 
-        Pipeline (optimized for minimal Browser Use credits):
-        1. Two concurrent Google searches (recruiter + engineer) — 2 Browser Use tasks
-        2. Interleave + deduplicate
-        3. OpenAI validation to filter false positives (concurrent)
-        4. OpenAI priority scoring
+        With Serper API: 5 queries → 30–40 raw → hard filter → validation → scoring → diversity selection.
+        Without Serper: 2 Browser Use tasks → interleave → validation → scoring → diversity selection.
         """
-        team_keyword = self._extract_team_keyword(role)
+        if settings.serper_api_key:
+            return await self._find_people_serper(company, role, target_count)
+        return await self._find_people_browser(company, role, target_count)
 
-        # Step 1: Run both searches concurrently (2 Browser Use tasks)
+    async def _find_people_serper(
+        self, company: str, role: str, target_count: int
+    ) -> list[Person]:
+        """Wide-net pipeline: Serper → hard filter → validation → scoring → diversity selection."""
+        all_people = await self.search_serper_wide(company, role)
+        if not all_people:
+            logger.warning("Serper returned no candidates for %s", company)
+            return []
+
+        all_people = [p for p in all_people if hard_filter(p, role)]
+        logger.info("After hard filter: %d candidates", len(all_people))
+        if not all_people:
+            return []
+
+        all_people = await self._filter_valid_people(all_people, company)
+        logger.info("After validation: %d confirmed employees", len(all_people))
+        if not all_people:
+            return []
+
+        people = [
+            Person(
+                name=lp.name,
+                title=lp.title,
+                company=company,
+                linkedin_url=lp.linkedin_url,
+                recent_activity=lp.recent_activity,
+                profile_summary=lp.recent_activity,
+            )
+            for lp in all_people
+        ]
+
+        logger.info("Scoring %d people for reply likelihood...", len(people))
+        scored = await score_people(people, role, company)
+        final = select_final_contacts(scored, target=target_count)
+        logger.info("People finder complete: %d final contacts for %s", len(final), company)
+        return final
+
+    async def _find_people_browser(
+        self, company: str, role: str, target_count: int
+    ) -> list[Person]:
+        """Fallback: Browser Use (2 tasks) → validation → scoring → diversity selection."""
+        team_keyword = self._extract_team_keyword(role)
         logger.info("Searching for %s recruiters and %s %s (concurrent)...", company, company, team_keyword)
         recruiter_task = self.search_google_for_linkedin(company, "recruiter")
         engineer_task = self.search_google_for_linkedin(company, team_keyword)
-
-        recruiter_results, engineer_results = await asyncio.gather(
-            recruiter_task, engineer_task
-        )
+        recruiter_results, engineer_results = await asyncio.gather(recruiter_task, engineer_task)
         logger.info("Found %d recruiters + %d engineers/managers", len(recruiter_results), len(engineer_results))
 
-        # Step 2: Fallback if either search returned too few results
         if len(recruiter_results) < 2 and len(engineer_results) < 2:
             logger.info("Too few results, trying LinkedIn direct search...")
-            fallback_results = await self.search_linkedin(company, "recruiter")
-            recruiter_results.extend(fallback_results)
+            recruiter_results.extend(await self.search_linkedin(company, "recruiter"))
 
-        # Step 3: Interleave for balanced mix, then dedup
         interleaved: list[LinkedInPerson] = []
         max_len = max(len(recruiter_results), len(engineer_results))
         for i in range(max_len):
@@ -202,36 +341,26 @@ Answer with ONLY "yes" or "no".
                 interleaved.append(engineer_results[i])
 
         all_people = self._deduplicate(interleaved)
-        logger.info("After interleave + dedup: %d unique people", len(all_people))
-
-        # Step 3.5: Validate people actually work at the company (OpenAI post-filter)
+        all_people = [p for p in all_people if hard_filter(p, role)]
         all_people = await self._filter_valid_people(all_people, company)
-        logger.info("After validation: %d confirmed employees", len(all_people))
 
-        # Trim to target count
-        all_people = all_people[:target_count]
-
-        # Step 4: Build Person objects.
-        # Enrichment comes from Google search snippets (captured in recent_activity).
-        # LinkedIn profile scraping is skipped — Firecrawl blocks LinkedIn and
-        # Browser Use per-profile is too expensive. Deeper personalization context
-        # comes from company research in Phase 4 instead.
-        people: list[Person] = []
-        for lp in all_people:
-            people.append(Person(
+        people = [
+            Person(
                 name=lp.name,
                 title=lp.title,
                 company=company,
                 linkedin_url=lp.linkedin_url,
                 recent_activity=lp.recent_activity,
                 profile_summary=lp.recent_activity,
-            ))
+            )
+            for lp in all_people
+        ]
 
-        # Step 5: Priority scoring via OpenAI
         logger.info("Scoring %d people for relevance to '%s'...", len(people), role)
         scored = await score_people(people, role, company)
-        logger.info("People finder complete: %d scored people for %s", len(scored), company)
-        return scored
+        final = select_final_contacts(scored, target=target_count)
+        logger.info("People finder complete: %d final contacts for %s", len(final), company)
+        return final
 
     # ── Helpers ───────────────────────────────────────────────────────────
 

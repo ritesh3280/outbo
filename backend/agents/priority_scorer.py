@@ -14,26 +14,31 @@ from backend.models.schemas import Person
 
 logger = logging.getLogger(__name__)
 
-SCORING_SYSTEM_PROMPT = """You are an expert at evaluating cold outreach targets for job applicants.
+SCORING_SYSTEM_PROMPT = """You are ranking people by how likely they are to respond to a cold email from a college student applying for a role at a company.
 
-Given a list of people at a company and the role being applied for, score each person 0.0 to 1.0 on how useful they would be to contact for a cold outreach email.
+Score each person 0-100 based on these criteria:
 
-Scoring criteria:
-- University/campus recruiter → 0.90-1.00 (highest priority for internships)
-- Hiring manager on the relevant team → 0.80-0.95
-- Technical recruiter on the relevant team → 0.75-0.90
-- Engineer on the relevant team who posts about hiring → 0.70-0.85
-- General recruiter → 0.60-0.75
-- Engineer on the relevant team → 0.50-0.70
-- Engineering manager on a different team → 0.40-0.55
-- Random employee → 0.10-0.30
+REPLY LIKELIHOOD (most important):
+- Campus/university recruiters → 90-100 (this is literally their job)
+- Early career / new grad recruiters → 85-95
+- General technical recruiters → 70-85
+- Junior engineers (1-3 years exp, recent grads) → 60-80 (they remember applying recently, most empathetic)
+- Mid-level engineers on the relevant team → 40-60
+- Engineering managers → 30-50 (busy but can refer directly)
+- Senior/staff engineers → 20-40 (busy, less likely to reply)
 
-Bonus (add up to +0.10):
-- Recently posted about hiring, open roles, or interns
-- Has "university", "campus", "new grad", "early career" in their title
-- Is a manager or lead on the team relevant to the role
+NEGATIVE SIGNALS (reduce score):
+- Title suggests 10+ years experience → -20
+- No connection to recruiting or the target team → -30
+- Title is vague or unclear → -15
 
-For each person, return a JSON array with their score and a short reason.
+BONUS SIGNALS (increase score):
+- Recent activity mentions hiring, interns, or open roles → +15
+- Title includes "university", "campus", "early career" → +20
+- Title matches the exact team for the role → +10
+- Profile snippet mentions mentoring or helping students → +10
+
+Return a JSON array of objects, one per person, in the same order: [{"name": "...", "score": N, "reason": "..."}]. Use score 0-100.
 """
 
 
@@ -76,8 +81,8 @@ async def score_people(
         f"Company: {company}\n"
         f"Role being applied for: {role}\n\n"
         f"People to score:\n{json.dumps(people_data, indent=2)}\n\n"
-        f"Return a JSON array of objects, one per person, in the same order:\n"
-        f'[{{"name": "...", "score": 0.85, "reason": "..."}}]'
+        f"Return a JSON array of objects, one per person, in the same order. Use score 0-100:\n"
+        f'[{{"name": "...", "score": 85, "reason": "..."}}]'
     )
 
     try:
@@ -130,13 +135,14 @@ async def score_people(
         for person in people:
             entry = score_map.get(person.name.strip().lower())
             if entry:
-                person.priority_score = max(0.0, min(1.0, float(entry.get("score", 0.5))))
+                raw_score = float(entry.get("score", 50))
+                person.priority_score = max(0.0, min(1.0, raw_score / 100.0))
                 person.priority_reason = entry.get("reason", "")
             else:
-                # Fall back to index-based matching
                 idx = people.index(person)
                 if idx < len(scores):
-                    person.priority_score = max(0.0, min(1.0, float(scores[idx].get("score", 0.5))))
+                    raw_score = float(scores[idx].get("score", 50))
+                    person.priority_score = max(0.0, min(1.0, raw_score / 100.0))
                     person.priority_reason = scores[idx].get("reason", "")
 
         # Sort by priority score descending
