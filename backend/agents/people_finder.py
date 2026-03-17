@@ -30,6 +30,35 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+
+def _extract_name_from_linkedin_url(url: str) -> str:
+    """Extract a full name from a LinkedIn URL slug like /in/claire-robert."""
+    match = re.search(r"linkedin\.com/in/([a-zA-Z0-9-]+)", url)
+    if not match:
+        return ""
+    slug = match.group(1).lower()
+    # Remove trailing ID suffixes (e.g., claire-robert-1234ab, claire-robert-123)
+    slug = re.sub(r"-[\da-f]{4,}$", "", slug)
+    slug = re.sub(r"-\d+$", "", slug)
+    parts = [p for p in slug.split("-") if p.isalpha()]
+    # Require at least 2 parts, each with 2+ chars (reject single-letter parts like "t")
+    if len(parts) >= 2 and all(len(p) >= 2 for p in parts):
+        return " ".join(p.capitalize() for p in parts)
+    return ""
+
+
+def _extract_slug_from_url(url: str) -> str:
+    """Extract the normalized profile slug from a LinkedIn URL for dedup."""
+    match = re.search(r"linkedin\.com/in/([a-zA-Z0-9-]+)", url)
+    if not match:
+        return ""
+    slug = match.group(1).lower()
+    # Normalize: strip trailing IDs so /in/claire-robert and /in/claire-robert-123 match
+    slug = re.sub(r"-[\da-f]{4,}$", "", slug)
+    slug = re.sub(r"-\d+$", "", slug)
+    return slug
+
+
 # ── Hard filter: exclude people who will rarely reply to intern cold emails ───
 
 EXCLUDE_KEYWORDS = {
@@ -84,11 +113,16 @@ def select_final_contacts(
     """
     scored_people = sorted(scored_people, key=lambda p: p.priority_score, reverse=True)
 
-    # Step 0: Quality threshold — drop low-scoring contacts with no warm signals
-    qualified = [
-        p for p in scored_people
-        if p.priority_score >= QUALITY_THRESHOLD or p.warm_signals
-    ]
+    # Step 0: Quality threshold — drop low-scoring contacts with no warm signals.
+    # Warm signals can exempt from the full threshold, but contacts must still
+    # meet a minimum floor (influence > 0 or score >= 0.40) to avoid wasting
+    # slots on zero-influence unknowns who merely share a university.
+    qualified = []
+    for p in scored_people:
+        if p.priority_score >= QUALITY_THRESHOLD:
+            qualified.append(p)
+        elif p.warm_signals and (p.influence_score > 0 or p.priority_score >= 0.40):
+            qualified.append(p)
     if not qualified:
         qualified = scored_people[:3]  # edge case: keep top 3 regardless
 
@@ -169,6 +203,17 @@ class PeopleFinder:
         job_title = " - ".join(parts[1:]) if len(parts) > 1 else ""
         if not name:
             return None
+
+        # Detect truncated names (e.g. "Claire J." → single-char last name)
+        name_parts = name.split()
+        if len(name_parts) >= 2:
+            last_part = name_parts[-1].rstrip(".")
+            if len(last_part) == 1:
+                full_name = _extract_name_from_linkedin_url(link)
+                if full_name:
+                    logger.info("  Name recovery: '%s' → '%s' (from URL slug)", name, full_name)
+                    name = full_name
+
         return LinkedInPerson(
             name=name,
             title=job_title,
@@ -598,24 +643,31 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
         return None
 
     def _deduplicate(self, people: list[LinkedInPerson]) -> list[LinkedInPerson]:
-        """Remove duplicate people based on LinkedIn URL or name. Preserve earliest discovery_source."""
+        """Remove duplicate people based on LinkedIn URL, URL slug, or name."""
         seen_urls: set[str] = set()
         seen_names: set[str] = set()
+        seen_slugs: set[str] = set()
         unique: list[LinkedInPerson] = []
 
         for p in people:
             url_key = p.linkedin_url.rstrip("/").lower() if p.linkedin_url else ""
             name_key = p.name.strip().lower()
+            slug = _extract_slug_from_url(url_key)
 
             if url_key and url_key in seen_urls:
                 continue
             if name_key and name_key in seen_names:
+                continue
+            # Slug dedup catches "Claire J." vs "Claire Robert" with same /in/claire-robert
+            if slug and slug in seen_slugs:
                 continue
 
             if url_key:
                 seen_urls.add(url_key)
             if name_key:
                 seen_names.add(name_key)
+            if slug:
+                seen_slugs.add(slug)
             unique.append(p)
 
         return unique

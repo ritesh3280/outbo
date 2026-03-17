@@ -41,6 +41,7 @@ REACHABILITY (how likely they are to respond to a cold email from a student):
 - Has public email or active GitHub → 70-85
 - Senior/staff with no recent activity → 20-40
 - Executive level → 10-25
+- Unknown role (title is just the company name, no actual job title visible) → 30-50. Do NOT assume high reachability just because they share a warm signal — without role info, we cannot assess responsiveness.
 
 WARM SIGNAL BONUSES (apply to reachability):
 - Same university as the applicant → +15

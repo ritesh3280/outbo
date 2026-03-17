@@ -33,6 +33,20 @@ class CompanyContext(BaseModel):
     relevant_role_info: str = ""
 
 
+_ERROR_TITLES = {"not found", "404", "page not found", "error", "403 forbidden", "access denied"}
+
+
+def _is_error_page(result) -> bool:
+    """Detect soft 404/error pages that Firecrawl reports as success."""
+    if result.title and result.title.strip().lower() in _ERROR_TITLES:
+        return True
+    if result.content and len(result.content) < 500:
+        start = result.content[:200].lower()
+        if "page not found" in start or "404" in start:
+            return True
+    return False
+
+
 async def research_company(
     company: str,
     role: str,
@@ -63,12 +77,14 @@ async def research_company(
     logger.info("Researching %s — scraping %d URLs...", company, len(urls))
     results = await scraper.scrape_multiple(urls)
 
-    # Collect whatever we got
+    # Collect whatever we got (skip error/404 pages)
     scraped_text = ""
     for r in results:
-        if r.success and r.content:
+        if r.success and r.content and not _is_error_page(r):
             # Truncate each page to keep total context manageable
             scraped_text += f"\n\n--- {r.title or r.url} ---\n{r.content[:3000]}"
+        elif r.success and _is_error_page(r):
+            logger.info("Skipping error page: %s (title: %s)", r.url, r.title)
 
     if not scraped_text.strip():
         logger.warning("No content scraped for %s", company)

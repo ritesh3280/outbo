@@ -65,7 +65,7 @@ async def analyze_job_posting(
 {{
     "team": "exact team name (e.g. 'Platform Infrastructure') or empty string if not stated",
     "department": "engineering, product, data, etc.",
-    "hiring_manager": "name if mentioned, else empty string",
+    "hiring_manager": "a specific person's NAME (first + last) mentioned as the hiring manager, recruiter, or contact. Must be an actual name like 'Jane Smith', NOT a job title like 'Senior Engineer'. Empty string if no specific person is named.",
     "tech_stack": ["list", "of", "technologies", "mentioned"],
     "key_requirements": ["top 3-4 requirements or responsibilities"],
     "keywords": ["terms that someone on this team would have in their LinkedIn title"],
@@ -106,6 +106,22 @@ Job posting:
             "email_domain": data.get("email_domain") or _extract_email_domain_from_text(content),
             "reporting_to": data.get("reporting_to") or "",
         }
+        # Validate hiring_manager is a person's name, not a job title
+        hm = out["hiring_manager"]
+        if hm:
+            _ROLE_WORDS = {"engineer", "manager", "recruiter", "developer", "lead", "director",
+                           "designer", "analyst", "coordinator", "specialist", "architect",
+                           "intern", "associate", "senior", "junior", "staff", "principal",
+                           "full", "stack", "frontend", "backend", "front-end", "back-end",
+                           "head", "vp", "chief", "officer"}
+            hm_words = [w.lower().rstrip(".,") for w in hm.split()]
+            # If every word is a role word, it's definitely a title not a name
+            # If most words (>50%) are role words, likely a title
+            role_word_count = sum(1 for w in hm_words if w in _ROLE_WORDS)
+            if role_word_count > 0 and role_word_count >= len(hm_words) * 0.5:
+                logger.info("Clearing hiring_manager '%s' — looks like a title, not a name", hm)
+                out["hiring_manager"] = ""
+
         logger.info("Job context extracted: team=%s, department=%s, hiring_manager=%s, email_domain=%s", out["team"], out["department"], out["hiring_manager"], out["email_domain"])
         return out
     except Exception as e:
@@ -141,6 +157,53 @@ def _empty_job_context() -> JobContext:
         "email_domain": "",
         "reporting_to": "",
     }
+
+
+# ── Helpers ───────────────────────────────────────────────────────────────
+
+
+def _parse_reporting_to(reporting_to: str) -> tuple[str, str]:
+    """Parse 'report to a Senior Engineer on the Subscriptions Enablement team' into (role, team).
+
+    Returns (role_title, team_name). Either may be empty string.
+    """
+    text = reporting_to.strip()
+    # Strip common prefixes
+    for prefix in [
+        "report to a ", "report to an ", "report to the ",
+        "reports to a ", "reports to an ", "reports to the ",
+        "reporting to a ", "reporting to an ", "reporting to the ",
+        "report to ", "reports to ", "reporting to ",
+    ]:
+        if text.lower().startswith(prefix):
+            text = text[len(prefix):]
+            break
+
+    # Split on team separator
+    role_title = ""
+    team_name = ""
+    for sep in [" on the ", " on ", " in the ", " in "]:
+        idx = text.lower().find(sep)
+        if idx >= 0:
+            role_title = text[:idx].strip()
+            team_name = text[idx + len(sep):].strip()
+            for suffix in [" team", " group", " org"]:
+                if team_name.lower().endswith(suffix):
+                    team_name = team_name[: len(team_name) - len(suffix)].strip()
+            break
+
+    if not role_title:
+        role_title = text  # No separator found — whole thing is the role
+
+    # Truncate fluff: "Full Stack Engineer who will support your growth" → "Full Stack Engineer"
+    if len(role_title.split()) > 5:
+        for fluff_sep in [" who ", " that ", " and will ", " and "]:
+            idx = role_title.lower().find(fluff_sep)
+            if idx >= 0:
+                role_title = role_title[:idx].strip()
+                break
+
+    return (role_title, team_name)
 
 
 # ── Dynamic, tiered query builder ─────────────────────────────────────────
@@ -182,6 +245,7 @@ def build_search_queries(
     job_title_exact = jc.get("job_title_exact", "") or ""
     hiring_manager = jc.get("hiring_manager", "") or ""
     hiring_signals = jc.get("hiring_signals", [])
+    tech_stack = jc.get("tech_stack", [])
 
     # ── TIER 1: Job-posting-driven ────────────────────────────────────
     if job_url:
@@ -215,46 +279,55 @@ def build_search_queries(
     # ── TIER 1b: Reporting structure (find the person this role reports to)
     reporting_to = jc.get("reporting_to", "") or ""
     if reporting_to:
-        queries.append(QueryGroup(
-            query=f'site:linkedin.com/in "{company}" "{reporting_to}"',
-            category="reporting_manager",
-            priority=1,
-        ))
-        # If a team name is embedded, search for it specifically
-        for sep in [" on the ", " on ", " in the ", " in "]:
-            if sep in reporting_to:
-                team_part = reporting_to.split(sep)[-1].rstrip(" team").strip()
-                if team_part and team_part.lower() != (team or "").lower():
-                    queries.append(QueryGroup(
-                        query=f'site:linkedin.com/in "{company}" "{team_part}"',
-                        category="reporting_manager",
-                        priority=1,
-                    ))
-                break
+        role_title, team_name = _parse_reporting_to(reporting_to)
+        if role_title:
+            queries.append(QueryGroup(
+                query=f'site:linkedin.com/in "{company}" "{role_title}"',
+                category="reporting_manager",
+                priority=1,
+            ))
+        if team_name:
+            last_word = role_title.split()[-1] if role_title else "engineer"
+            queries.append(QueryGroup(
+                query=f'site:linkedin.com/in "{company}" "{team_name}" {last_word}',
+                category="reporting_manager",
+                priority=1,
+            ))
 
     # ── TIER 2: Team-specific ─────────────────────────────────────────
-    if team:
+    # Prefer keywords and tech stack (which appear on LinkedIn) over internal team names
+
+    # 2a: Job context keywords (e.g., "Software Engineer Intern", "Intern")
+    for kw in keywords[:2]:
+        kw = kw.strip()
+        if kw and kw.lower() != (team or "").lower() and not kw.startswith("http"):
+            queries.append(QueryGroup(
+                query=f'site:linkedin.com/in "at {company}" "{kw}"',
+                category="team_search",
+                priority=2,
+            ))
+
+    # 2b: Tech stack terms (people list these on LinkedIn)
+    if tech_stack:
+        tech_terms = " OR ".join(f'"{t}"' for t in tech_stack[:3])
         queries.append(QueryGroup(
-            query=f'site:linkedin.com/in "at {company}" "{team}" engineer OR developer',
-            category="team_search",
-            priority=2,
-        ))
-        queries.append(QueryGroup(
-            query=f'site:linkedin.com/in "at {company}" "{team}" manager OR lead',
+            query=f'site:linkedin.com/in "at {company}" {tech_terms}',
             category="team_search",
             priority=2,
         ))
 
+    # 2c: Team name as backup (may work for well-known teams)
+    if team:
+        queries.append(QueryGroup(
+            query=f'site:linkedin.com/in "at {company}" "{team}" engineer OR manager',
+            category="team_search",
+            priority=2,
+        ))
+
+    # 2d: Department-based (if different from team)
     if department and department.lower() != (team or "").lower():
         queries.append(QueryGroup(
             query=f'site:linkedin.com/in "at {company}" "{department}" engineer OR developer',
-            category="team_search",
-            priority=2,
-        ))
-
-    if first_keyword and first_keyword != team:
-        queries.append(QueryGroup(
-            query=f'site:linkedin.com/in "at {company}" "{first_keyword}"',
             category="team_search",
             priority=2,
         ))
@@ -274,9 +347,10 @@ def build_search_queries(
                 priority=3,
             ))
 
-    # ── TIER 4: Recency signals ───────────────────────────────────────
+    # ── TIER 4: Broad role match ──────────────────────────────────────
+    tier4_kw = first_keyword if first_keyword and not first_keyword.startswith("http") else "engineer"
     queries.append(QueryGroup(
-        query=f'site:linkedin.com/in "at {company}" "{role_keyword}" hiring 2026',
+        query=f'site:linkedin.com/in "at {company}" {tier4_kw} engineer OR developer',
         category="general",
         priority=4,
     ))

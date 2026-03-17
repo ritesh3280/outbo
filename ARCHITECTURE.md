@@ -291,7 +291,7 @@ Scrapes the job posting via Firecrawl, then extracts structured context via Open
 1. LLM extraction from the posting text (e.g. "apply to jobs@gc.com" → `gc.com`)
 2. Regex fallback scanning for `@domain.com` patterns (skips gmail/yahoo/hotmail/outlook/example)
 
-**Reporting structure** is extracted when the posting mentions who the role reports to (e.g. "report to a Senior Engineer on the Subscriptions Enablement team"). This generates tier-1 targeted search queries for that person.
+**Reporting structure** is extracted when the posting mentions who the role reports to (e.g. "report to a Senior Engineer on the Subscriptions Enablement team"). The `_parse_reporting_to()` helper strips prefixes ("report to a/an/the") and splits on separators ("on the", "in the") to extract a role title ("Senior Engineer") and team name ("Subscriptions Enablement"). These are used to generate tier-1 targeted search queries — searching for the role and team separately rather than the verbatim phrase.
 
 This context feeds into tiered query building (Step 1), scoring (Step 1), email confidence boosting (Step 2), and email personalization (Step 4).
 
@@ -311,10 +311,12 @@ class QueryGroup:
 |------|----------|-----------|-----------------|----------|
 | 1 | 1 | `job_url` provided | `"{job_url}" site:linkedin.com`; `"Company" "Job Title" "hiring" OR "join my team"` | `job_posting_sharer` |
 | 1 | 1 | `hiring_manager` extracted | `site:linkedin.com/in "John Smith" "Stripe"` | `hiring_manager` |
-| 1 | 1 | `reporting_to` extracted | `site:linkedin.com/in "Company" "Senior Engineer on Subscriptions Enablement"` | `reporting_manager` |
-| 2 | 2 | `team` known | `"at Stripe" "Payments" engineer`; `"at Stripe" "Payments" manager` | `team_search` |
+| 1 | 1 | `reporting_to` extracted | `"Company" "Senior Engineer"` (parsed role); `"Company" "Subscriptions Enablement" Engineer` (parsed team + role keyword) | `reporting_manager` |
+| 2 | 2 | `keywords` from job | `"at Stripe" "Software Engineer Intern"`; `"at Stripe" "Intern"` | `team_search` |
+| 2 | 2 | `tech_stack` from job | `"at Stripe" "TypeScript" OR "React" OR "Node"` | `team_search` |
+| 2 | 2 | `team` known (backup) | `"at Stripe" "Payments" engineer OR manager` | `team_search` |
 | 3 | 3 | `user_profile` has data | `"at Stripe" "University of Maryland"`; `"at Stripe" previously "Google"` | `warm_path` |
-| 4 | 4 | Always | `"at Stripe" "engineer" hiring 2026` | `general` |
+| 4 | 4 | Always | `"at Stripe" Software Engineer Intern engineer OR developer` | `general` |
 | 5 | 5 | Always (fallback) | University recruiter, general recruiter, engineering manager, hiring/intern | `recruiter` / `general` |
 
 Queries are sorted by priority and capped at 10 to control Serper API costs (~$0.01 per campaign).
@@ -357,6 +359,12 @@ The loaded/extracted profile is:
 **Without Serper** (fallback — uses Browser Use):
 - Runs 2 AI-powered browser searches on Google/LinkedIn
 - Slower and more expensive
+
+#### Name Recovery & Deduplication
+
+Serper sometimes returns truncated LinkedIn names (e.g. "Claire J." instead of "Claire Robert"). The pipeline handles this:
+- **Name recovery**: If the parsed last name is a single character (e.g. "J."), `_extract_name_from_linkedin_url()` extracts the full name from the LinkedIn URL slug (`/in/claire-robert` → "Claire Robert")
+- **Slug-based dedup**: In addition to URL and name matching, `_deduplicate()` extracts URL slugs (stripping trailing IDs) so that "Claire J." and "Claire Robert" from the same `/in/claire-robert` profile are correctly merged
 
 #### Hard Filtering (deterministic, no LLM)
 
@@ -436,8 +444,9 @@ Has a heuristic fallback if OpenAI is unavailable that produces the same dual-ax
 
 Before diversity selection, contacts are filtered by quality:
 - **Threshold**: `QUALITY_THRESHOLD = 0.60`
+- Contacts at or above 0.60 are always kept
+- Contacts below 0.60 with warm signals are kept **only if** they have `influence_score > 0` or `priority_score >= 0.40` — this prevents zero-influence unknowns (e.g. someone who merely shares your university but has no discernible role) from wasting a slot
 - Contacts below 0.60 with no warm signals are dropped
-- Contacts with warm signals are always kept regardless of score
 - Edge case: if no contacts pass the threshold, the top 3 are kept regardless
 
 This prevents low-quality filler contacts from diluting the list.
@@ -491,7 +500,8 @@ The email finder now accepts `job_context` from the orchestrator. If a pattern-m
 **Goal**: Build company context for personalized emails.
 
 1. Scrapes 3 pages via Firecrawl: `/about`, `/blog`, `/careers`
-2. OpenAI summarizes into structured context: mission, recent news, blog highlights, engineering culture signals, role-specific info
+2. Filters out soft 404/error pages via `_is_error_page()` — checks title against known error strings ("Not Found", "404", "Page not found", etc.) and short content. Skipped pages are logged rather than silently passed to OpenAI
+3. OpenAI summarizes into structured context: mission, recent news, blog highlights, engineering culture signals, role-specific info
 
 ### Step 4: Generate Emails (`email_writer.py`)
 
@@ -676,7 +686,11 @@ A typical campaign costs roughly **$0.02-0.10** depending on which APIs are conf
 14. **No authentication**: Currently a local-only, single-user tool with no auth layer.
 15. **In-memory fallback**: Works without MongoDB for quick local testing.
 16. **Persistent profile over scraping**: LinkedIn scraping via Firecrawl is unreliable (login walls). Instead, users paste their info once into a saved profile that's reused across all campaigns, completely bypassing scraping.
-17. **Quality threshold**: Contacts below 0.60 priority score with no warm signals are dropped. Fewer strong contacts beat more weak ones.
+17. **Quality threshold**: Contacts below 0.60 priority score with no warm signals are dropped. Warm contacts must still have influence > 0 or score >= 0.40 to pass. Fewer strong contacts beat more weak ones.
 18. **Job posting domain boost**: Email confidence is boosted from LOW to MEDIUM when the email domain matches one extracted from the job posting — a strong signal that pattern-matched emails are correct.
 19. **Angle confidence labels**: Outreach angles are classified as "verified" (only references data in the profile) or "suggested" (involves LLM inference). This helps users trust the angles and know which ones to double-check.
-20. **Reporting structure search**: When a job posting mentions who the role reports to, tier-1 targeted queries are generated to find that specific person — often the most valuable contact.
+20. **Reporting structure search**: When a job posting mentions who the role reports to, the `_parse_reporting_to()` helper extracts role + team and generates tier-1 queries — searching for "Senior Engineer" and "Subscriptions Enablement Engineer" rather than the verbatim phrase.
+21. **Terminal logging**: `logging.basicConfig(level=INFO)` in `main.py` enables all `logger.info()` calls across the pipeline to print to the terminal. The orchestrator logs each step with timing, the query builder logs all queries with tier/category, the people finder logs per-query result counts and quality threshold drops, and the email finder logs domain confidence boosts. Third-party loggers (httpx, openai, firecrawl) are silenced to WARNING.
+22. **Smart query generation**: Tier 2 queries use job context keywords and tech stack terms (which appear on LinkedIn profiles) rather than internal team names (which don't). Tier 4 guards against URL values in role keywords. Reporting manager queries parse natural language into searchable role + team components.
+23. **Name recovery from URL slugs**: When Serper returns truncated names (e.g. "Claire J."), the full name is recovered from the LinkedIn URL slug (`/in/claire-robert` → "Claire Robert"). Dedup also uses URL slugs to catch duplicate profiles with different display names.
+24. **Soft 404 detection**: Company research filters out error pages before passing content to OpenAI — checks page titles against known error strings and short content length.
