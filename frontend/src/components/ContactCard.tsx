@@ -11,6 +11,15 @@ interface Props {
   onEmailGenerated?: (draft: EmailDraft) => void;
 }
 
+function formatWarmSignal(signal: string): string {
+  if (signal.startsWith('same_university:')) return `Same University: ${signal.split(':')[1]}`;
+  if (signal.startsWith('shared_company:')) return `Former Colleague: ${signal.split(':')[1]}`;
+  if (signal === 'posted_about_hiring') return 'Posted About Hiring';
+  if (signal === 'recently_joined') return 'Recently Joined';
+  if (signal === 'shared_job_posting') return 'Shared Job Posting';
+  return signal.replace(/_/g, ' ');
+}
+
 const CONFIDENCE_STYLES: Record<string, string> = {
   high: 'bg-green-50 text-green-700 border-green-200',
   medium: 'bg-amber-50 text-amber-700 border-amber-200',
@@ -94,11 +103,36 @@ export default function ContactCard({
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2">
             <h3 className="font-medium text-gray-900 truncate">{person.name}</h3>
-            <span className="text-xs text-gray-400">
+            {person.contact_category && (
+              <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 border border-gray-200">
+                {person.contact_category.replace('_', ' ')}
+              </span>
+            )}
+            <span className="text-xs text-gray-400" title={`Influence: ${(person.influence_score * 100).toFixed(0)} · Reachability: ${(person.reachability_score * 100).toFixed(0)}`}>
               {(person.priority_score * 100).toFixed(0)}
             </span>
           </div>
           <p className="text-sm text-gray-500 truncate">{person.title}</p>
+          {person.outreach_angle && (
+            <p className="text-xs text-blue-600 mt-0.5 italic truncate">
+              {person.outreach_angle}
+              {person.angle_confidence === 'verified' && (
+                <span className="ml-1.5 not-italic text-green-600 font-medium">verified</span>
+              )}
+              {person.angle_confidence === 'suggested' && (
+                <span className="ml-1.5 not-italic text-gray-400 font-medium">suggested</span>
+              )}
+            </p>
+          )}
+          {person.warm_signals && person.warm_signals.length > 0 && (
+            <div className="flex flex-wrap gap-1 mt-1">
+              {person.warm_signals.map((signal) => (
+                <span key={signal} className="text-xs px-1.5 py-0.5 rounded bg-purple-50 text-purple-700 border border-purple-200">
+                  {formatWarmSignal(signal)}
+                </span>
+              ))}
+            </div>
+          )}
           {emailResult?.email && (
             <div className="flex items-center gap-2 mt-1">
               <span className="text-sm text-gray-600">{emailResult.email}</span>

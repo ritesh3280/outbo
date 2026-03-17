@@ -12,6 +12,7 @@ from backend.models.schemas import SearchResult
 logger = logging.getLogger(__name__)
 
 COLLECTION_JOBS = "jobs"
+COLLECTION_PROFILES = "profiles"
 
 _client: Optional[AsyncIOMotorClient] = None
 _db: Optional[AsyncIOMotorDatabase] = None
@@ -112,3 +113,52 @@ async def list_jobs() -> list[SearchResult]:
     except Exception as e:
         logger.warning("list_jobs failed: %s", e)
         return []
+
+
+# ── Profile CRUD ─────────────────────────────────────────────────────────
+
+
+async def get_profile(profile_id: str) -> Optional[dict]:
+    """Load a user profile by id. Returns None if not found or DB not connected."""
+    db = get_db()
+    if db is None:
+        return None
+    try:
+        doc = await db[COLLECTION_PROFILES].find_one({"_id": profile_id})
+        if not doc:
+            return None
+        out = dict(doc)
+        out.pop("_id", None)
+        return out
+    except Exception as e:
+        logger.warning("get_profile failed for %s: %s", profile_id, e)
+        return None
+
+
+async def save_profile(doc: dict) -> None:
+    """Upsert a user profile. No-op if MongoDB not connected."""
+    db = get_db()
+    if db is None:
+        return
+    try:
+        profile_id = doc.get("profile_id", "default")
+        to_save = dict(doc)
+        to_save["_id"] = profile_id
+        await db[COLLECTION_PROFILES].replace_one(
+            {"_id": profile_id},
+            to_save,
+            upsert=True,
+        )
+    except Exception as e:
+        logger.warning("save_profile failed: %s", e)
+
+
+async def delete_profile(profile_id: str) -> None:
+    """Delete a user profile. No-op if MongoDB not connected."""
+    db = get_db()
+    if db is None:
+        return
+    try:
+        await db[COLLECTION_PROFILES].delete_one({"_id": profile_id})
+    except Exception as e:
+        logger.warning("delete_profile failed for %s: %s", profile_id, e)

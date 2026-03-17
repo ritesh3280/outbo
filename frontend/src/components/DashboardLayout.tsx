@@ -4,8 +4,10 @@ interface Props {
   onGoHome?: () => void;
   /** Called when user clicks "Campaigns" in sidebar */
   onOpenCampaigns?: () => void;
-  /** Which nav item to highlight: search, campaigns, or results (viewing a job) */
-  activeNav?: 'search' | 'campaigns' | 'results';
+  /** Called when user clicks "Profile" in sidebar */
+  onOpenProfile?: () => void;
+  /** Which nav item to highlight: search, campaigns, profile, or results (viewing a job) */
+  activeNav?: 'search' | 'campaigns' | 'profile' | 'results';
   /** Show back link in main header (e.g. when viewing a campaign) */
   showBack?: boolean;
   backLabel?: string;
@@ -24,6 +26,7 @@ export default function DashboardLayout({
   children,
   onGoHome,
   onOpenCampaigns,
+  onOpenProfile,
   activeNav,
   showBack,
   backLabel = 'New campaign',
@@ -52,6 +55,13 @@ export default function DashboardLayout({
             className={navButtonClass(activeNav === 'campaigns')}
           >
             Campaigns
+          </button>
+          <button
+            type="button"
+            onClick={() => onOpenProfile?.()}
+            className={navButtonClass(activeNav === 'profile')}
+          >
+            Profile
           </button>
         </nav>
       </aside>

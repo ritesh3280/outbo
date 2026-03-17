@@ -479,6 +479,7 @@ class EmailFinder:
         people: list[Person],
         company: str,
         company_website: str | None = None,
+        job_context: dict | None = None,
     ) -> list[EmailResult]:
         """Find emails for all people at a company.
 
@@ -486,6 +487,7 @@ class EmailFinder:
             people: List of Person objects.
             company: Company name.
             company_website: Optional URL of the company website (from user input).
+            job_context: Optional dict from job_analyzer (may contain email_domain).
 
         Returns:
             List of EmailResult objects, one per person.
@@ -503,9 +505,14 @@ class EmailFinder:
             company, domain, self.scraper
         )
 
+        # Extract email domain from job posting for confidence boost
+        job_posting_domain = ""
+        if job_context:
+            job_posting_domain = (job_context.get("email_domain") or "").strip().lower()
+
         # Find emails for each person concurrently
         tasks = [
-            self._find_email_for_person(person, domain, detected_pattern)
+            self._find_email_for_person(person, domain, detected_pattern, job_posting_domain)
             for person in people
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -533,6 +540,7 @@ class EmailFinder:
         person: Person,
         domain: str,
         detected_pattern: str | None,
+        job_posting_domain: str = "",
     ) -> EmailResult:
         """Find the email for a single person."""
         first, last = parse_name(person.name)
@@ -582,6 +590,14 @@ class EmailFinder:
         else:
             confidence = EmailConfidence.LOW
             source = f"Pattern guess (most common corporate format for {domain})"
+
+        # Boost: if email domain matches the domain found in the job posting
+        if confidence == EmailConfidence.LOW and job_posting_domain:
+            email_domain = patterns[0].split("@")[1].lower() if "@" in patterns[0] else ""
+            if email_domain == job_posting_domain:
+                confidence = EmailConfidence.MEDIUM
+                source = f"Pattern match (domain @{job_posting_domain} confirmed in job posting)"
+                logger.info("  Domain boost: %s LOW → MEDIUM (@%s from job posting)", person.name, job_posting_domain)
 
         return EmailResult(
             name=person.name,

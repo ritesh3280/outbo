@@ -83,6 +83,13 @@ export interface Person {
   priority_reason: string;
   recent_activity: string;
   profile_summary: string;
+  influence_score: number;
+  reachability_score: number;
+  contact_category: string;
+  outreach_angle: string;
+  warm_signals: string[];
+  discovery_source: string;
+  angle_confidence: string;
 }
 
 export interface EmailResult {
@@ -127,4 +134,46 @@ export interface HistoryEntry {
   status: string;
   people_count: number;
   drafts_count: number;
+}
+
+export interface UserProfileDoc {
+  profile_id: string;
+  name: string;
+  linkedin_url: string;
+  resume_url: string;
+  universities: string[];
+  previous_companies: string[];
+  skills: string[];
+  linkedin_headline: string;
+  linkedin_summary: string;
+  created_at: string;
+  updated_at: string;
+}
+
+// ── Profile API ────────────────────────────────────────────────────────
+
+export async function getProfile(): Promise<UserProfileDoc | null> {
+  const response = await fetch(`${API_BASE}/api/profile`);
+  if (!response.ok) return null;
+  const data = await response.json();
+  return data || null;
+}
+
+export async function saveProfile(
+  profile: Partial<UserProfileDoc>,
+): Promise<UserProfileDoc> {
+  const response = await fetch(`${API_BASE}/api/profile`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(profile),
+  });
+  if (!response.ok) throw new Error(`Save profile failed: ${response.status}`);
+  return response.json();
+}
+
+export async function deleteProfile(): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/profile`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) throw new Error(`Delete profile failed: ${response.status}`);
 }

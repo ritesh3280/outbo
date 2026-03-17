@@ -22,6 +22,13 @@ class Person(BaseModel):
     priority_reason: str = ""
     recent_activity: str = ""
     profile_summary: str = ""
+    influence_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    reachability_score: float = Field(default=0.0, ge=0.0, le=1.0)
+    contact_category: str = ""
+    outreach_angle: str = ""
+    warm_signals: list[str] = []
+    discovery_source: str = ""
+    angle_confidence: str = ""  # "verified" | "suggested"
 
 
 class EmailConfidence(str, Enum):
@@ -77,3 +84,19 @@ class SearchResult(BaseModel):
     company_context: Optional[dict] = None
     job_context: Optional[dict] = None
     user_info: Optional[str] = None
+    user_profile_data: Optional[dict] = None
+
+
+class UserProfileDoc(BaseModel):
+    """Persistent user profile — saved once, reused across all campaigns."""
+    profile_id: str = "default"
+    name: str = ""
+    linkedin_url: str = ""
+    resume_url: str = ""
+    universities: list[str] = []
+    previous_companies: list[str] = []
+    skills: list[str] = []
+    linkedin_headline: str = ""
+    linkedin_summary: str = ""
+    created_at: str = ""
+    updated_at: str = ""

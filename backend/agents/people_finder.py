@@ -1,15 +1,19 @@
 """People Finder Agent.
 
 Wide-net pipeline (when Serper API key is set):
-  5 Serper queries (~$0.005) → 30–40 candidates → hard filter → validation → scoring → diversity selection → 6–8 contacts.
+  Dynamic tiered queries → 30–40 candidates → hard filter → warm signal cross-reference →
+  validation (with recency) → scoring (dual-axis) → dynamic diversity selection → 6–8 contacts.
 
 Fallback (no Serper): 2 Browser Use tasks + validation + scoring.
 """
+
+from __future__ import annotations
 
 import asyncio
 import json
 import logging
 import re
+from typing import TYPE_CHECKING
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -19,7 +23,10 @@ from backend.models.schemas import Person
 from backend.tools.browser import BrowserTool
 from backend.tools.serper import search as serper_search
 from backend.agents.priority_scorer import score_people
-from backend.agents.job_analyzer import build_search_queries
+from backend.agents.job_analyzer import build_search_queries, QueryGroup
+
+if TYPE_CHECKING:
+    from backend.agents.user_profile_extractor import UserProfile
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +50,9 @@ class LinkedInPerson(BaseModel):
     title: str = ""
     linkedin_url: str = ""
     recent_activity: str = ""
+    discovery_source: str = ""
+    warm_signals: list[str] = []
+    profile_recency: str = "unknown"  # "active", "stale", "unknown"
 
 
 def hard_filter(person: LinkedInPerson, role: str) -> bool:
@@ -56,33 +66,82 @@ def hard_filter(person: LinkedInPerson, role: str) -> bool:
     return True
 
 
-def select_final_contacts(scored_people: list[Person], target: int = 8) -> list[Person]:
-    """Pick final contacts with diversity: at least 2 recruiters, 3 engineers, 1 manager."""
+QUALITY_THRESHOLD = 0.60
+
+
+def select_final_contacts(
+    scored_people: list[Person],
+    target: int = 8,
+) -> list[Person]:
+    """Dynamic diversity selection based on contact_category and warm signals.
+
+    Instead of fixed quotas (2 recruiters, 3 engineers, 1 manager), uses:
+    0. Quality threshold: drop contacts below 0.60 with no warm signals.
+    1. Always include anyone who shared the job posting.
+    2. Ensure at least 1 person from each available contact_category.
+    3. If warm connections exist, ensure at least 2 are included.
+    4. Fill remaining slots with highest-scoring candidates.
+    """
     scored_people = sorted(scored_people, key=lambda p: p.priority_score, reverse=True)
 
+    # Step 0: Quality threshold — drop low-scoring contacts with no warm signals
+    qualified = [
+        p for p in scored_people
+        if p.priority_score >= QUALITY_THRESHOLD or p.warm_signals
+    ]
+    if not qualified:
+        qualified = scored_people[:3]  # edge case: keep top 3 regardless
+
+    dropped = [p for p in scored_people if p not in qualified]
+    logger.info(
+        "Quality threshold: %d/%d passed (threshold=%.2f)",
+        len(qualified), len(scored_people), QUALITY_THRESHOLD,
+    )
+    for p in dropped:
+        logger.info("  Dropped: %s (score=%.2f, no warm signals)", p.name, p.priority_score)
+    scored_people = qualified
+
     selected: list[Person] = []
-    categories: dict[str, int] = {"recruiter": 0, "engineer": 0, "manager": 0}
-    TARGETS = {"recruiter": 2, "engineer": 3, "manager": 1}
+    selected_set: set[str] = set()  # track by name to avoid dupes
 
-    def categorize(title: str) -> str:
-        t = title.lower()
-        if "recruit" in t or "talent" in t:
-            return "recruiter"
-        if "manager" in t or "lead" in t:
-            return "manager"
-        return "engineer"
+    def _add(person: Person) -> bool:
+        if person.name in selected_set:
+            return False
+        selected.append(person)
+        selected_set.add(person.name)
+        return True
 
-    for person in scored_people:
-        cat = categorize(person.title)
-        if categories[cat] < TARGETS.get(cat, 0):
-            selected.append(person)
-            categories[cat] += 1
+    # Step 1: Always include job posting sharers
+    for p in scored_people:
         if len(selected) >= target:
             break
+        if p.discovery_source == "job_posting_sharer" or "shared_job_posting" in p.warm_signals:
+            _add(p)
 
-    for person in scored_people:
-        if person not in selected and len(selected) < target:
-            selected.append(person)
+    # Step 2: Ensure at least 1 from each available category
+    available_categories = {p.contact_category for p in scored_people if p.contact_category}
+    for cat in available_categories:
+        if len(selected) >= target:
+            break
+        cat_people = [p for p in scored_people if p.contact_category == cat and p.name not in selected_set]
+        if cat_people:
+            _add(cat_people[0])
+
+    # Step 3: Ensure at least 2 warm connections if available
+    warm_in_selected = sum(1 for p in selected if p.warm_signals)
+    if warm_in_selected < 2:
+        warm_candidates = [p for p in scored_people if p.warm_signals and p.name not in selected_set]
+        for p in warm_candidates:
+            if warm_in_selected >= 2 or len(selected) >= target:
+                break
+            if _add(p):
+                warm_in_selected += 1
+
+    # Step 4: Fill remaining with highest-scoring
+    for p in scored_people:
+        if len(selected) >= target:
+            break
+        _add(p)
 
     return selected
 
@@ -93,22 +152,10 @@ class PeopleFinder:
     def __init__(self, browser: BrowserTool | None = None):
         self.browser = browser or BrowserTool()
 
-    # ── Serper: wide net (5 queries, ~$0.005) ──────────────────────────────
-
-    def _serper_queries(self, company: str, team_keyword: str, job_context: dict | None = None) -> list[str]:
-        """Five targeted queries. If job_context provided, use build_search_queries for laser targeting."""
-        if job_context:
-            return build_search_queries(company, job_context)
-        return [
-            f'site:linkedin.com/in "at {company}" "university recruiter" OR "campus recruiter" OR "early career recruiter"',
-            f'site:linkedin.com/in "at {company}" "recruiter" OR "talent acquisition"',
-            f'site:linkedin.com/in "at {company}" "{team_keyword}"',
-            f'site:linkedin.com/in "at {company}" "engineering manager" OR "tech lead"',
-            f'site:linkedin.com/in "at {company}" "hiring" OR "intern" OR "internship"',
-        ]
+    # ── Serper: dynamic tiered queries ────────────────────────────────
 
     @staticmethod
-    def _parse_linkedin_from_serper(result) -> LinkedInPerson | None:
+    def _parse_linkedin_from_serper(result, category: str = "general") -> LinkedInPerson | None:
         """Parse one Serper organic result into LinkedInPerson if it's a LinkedIn profile."""
         link = (result.link or "").strip()
         if "linkedin.com/in/" not in link:
@@ -127,34 +174,54 @@ class PeopleFinder:
             title=job_title,
             linkedin_url=link,
             recent_activity=snippet,
+            discovery_source=category,
         )
 
     async def search_serper_wide(
-        self, company: str, role: str, job_context: dict | None = None
+        self,
+        company: str,
+        role: str,
+        job_context: dict | None = None,
+        user_profile: "UserProfile | None" = None,
+        job_url: str | None = None,
     ) -> list[LinkedInPerson]:
-        """Run 5 Serper queries concurrently, return aggregated LinkedIn profiles."""
+        """Run dynamic tiered Serper queries concurrently, return aggregated LinkedIn profiles."""
         team_keyword = self._extract_team_keyword(role)
-        queries = self._serper_queries(company, team_keyword, job_context)
-        logger.info("Running %d Serper queries for %s...", len(queries), company)
-        tasks = [serper_search(q, num=10) for q in queries]
+        query_groups = build_search_queries(
+            company=company,
+            job_context=job_context,
+            user_profile=user_profile,
+            job_url=job_url,
+            role_keyword=team_keyword,
+        )
+        logger.info("Running %d Serper queries for %s...", len(query_groups), company)
+
+        for i, qg in enumerate(query_groups, 1):
+            logger.info("  Query %d [tier %d, %s]: %s", i, qg.priority, qg.category, qg.query)
+
+        tasks = [serper_search(qg.query, num=10) for qg in query_groups]
         results_per_query = await asyncio.gather(*tasks)
+
         raw: list[LinkedInPerson] = []
-        for results in results_per_query:
+        for qg, results in zip(query_groups, results_per_query):
+            count = 0
             for r in results:
-                p = self._parse_linkedin_from_serper(r)
+                p = self._parse_linkedin_from_serper(r, category=qg.category)
                 if p:
                     raw.append(p)
+                    count += 1
+            logger.info("  [%s] → %d LinkedIn profiles", qg.category, count)
+
         deduped = self._deduplicate(raw)
         logger.info("Serper: %d raw → %d unique after dedup", len(raw), len(deduped))
         return deduped
 
-    # ── Browser Use search (fallback) ─────────────────────────────────────
+    # ── Browser Use search (fallback) ─────────────────────────────────
 
     async def search_google_for_linkedin(
         self, company: str, query: str, max_results: int = 10
     ) -> list[LinkedInPerson]:
         """Search Google to find LinkedIn profiles at a company."""
-        # Use "at {company}" to match LinkedIn's employment format and avoid name matches
         search_query = f'site:linkedin.com/in "at {company}" OR "{company} ·" "{query}"'
 
         task_prompt = (
@@ -203,72 +270,112 @@ class PeopleFinder:
 
         return self._parse_people_from_output(result.output)
 
-    # ── Validation ───────────────────────────────────────────────────────
+    # ── Warm signal cross-referencing ─────────────────────────────────
+
+    @staticmethod
+    def _cross_reference_warm_signals(
+        people: list[LinkedInPerson],
+        user_profile: "UserProfile | None",
+    ) -> list[LinkedInPerson]:
+        """Tag people with warm connection signals based on user profile and activity."""
+        for person in people:
+            text = f"{person.title} {person.recent_activity}".lower()
+
+            # Cross-reference with user's background
+            if user_profile:
+                for uni in user_profile.universities:
+                    if uni.lower() in text:
+                        person.warm_signals.append(f"same_university:{uni}")
+                for co in user_profile.previous_companies:
+                    if co.lower() in text:
+                        person.warm_signals.append(f"shared_company:{co}")
+
+            # Activity-based signals (work for all people regardless of user profile)
+            if any(kw in text for kw in ["hiring", "we're growing", "join my team", "open role", "we're hiring"]):
+                person.warm_signals.append("posted_about_hiring")
+            if any(kw in text for kw in ["just joined", "excited to announce", "new role", "thrilled to join", "started a new position"]):
+                person.warm_signals.append("recently_joined")
+
+        return people
+
+    # ── Validation ───────────────────────────────────────────────────
 
     async def _validate_person_works_at_company(
         self, person: LinkedInPerson, company: str
-    ) -> bool:
-        """Use OpenAI to validate if a person actually works at the company.
-        
-        Catches false positives from search (e.g., people with company name in their name).
-        Returns True if the person works at the company, False otherwise.
+    ) -> tuple[bool, str]:
+        """Use OpenAI to validate if a person works at the company and check profile recency.
+
+        Returns (works_here: bool, recency: str).
         """
         if not settings.openai_api_key:
-            return True  # Skip validation in stub mode
+            return True, "unknown"
 
         client = AsyncOpenAI(api_key=settings.openai_api_key)
-        
-        prompt = f"""Given this LinkedIn profile information, does this person currently work at "{company}"?
+
+        prompt = f"""Given this LinkedIn profile information, answer two questions about "{company}":
+
+1. Does this person CURRENTLY work at {company}? (yes/no)
+2. How recently does their profile seem to be updated? (active/stale/unknown)
+   - "active" = recent posts, 2024-2026 dates visible, recent activity
+   - "stale" = no recent updates, dates are 2+ years old
+   - "unknown" = can't tell from available info
 
 Name: {person.name}
 Title: {person.title}
 Profile snippet: {person.recent_activity[:300]}
 
-Answer with ONLY "yes" or "no". 
-- Answer "yes" if the title or snippet indicates they work/worked at {company}
-- Answer "no" if they just have a similar name or no clear connection to {company}"""
+Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" or "unknown"}}"""
 
         try:
             response = await client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role": "user", "content": prompt}],
                 temperature=0,
-                max_tokens=5,
+                response_format={"type": "json_object"},
+                max_tokens=50,
             )
-            answer = response.choices[0].message.content.strip().lower()
-            is_valid = "yes" in answer
-            
-            if not is_valid:
-                logger.info("Filtered out %s (title: %s) - doesn't work at %s", 
+            content = response.choices[0].message.content or "{}"
+            data = json.loads(content)
+            works_here = "yes" in str(data.get("works_here", "yes")).lower()
+            recency = data.get("recency", "unknown")
+            if recency not in ("active", "stale", "unknown"):
+                recency = "unknown"
+
+            if not works_here:
+                logger.info("Filtered out %s (title: %s) - doesn't work at %s",
                            person.name, person.title, company)
-            
-            return is_valid
+
+            return works_here, recency
         except Exception as e:
             logger.warning("Validation failed for %s: %s", person.name, e)
-            return True  # Default to keeping on error
+            return True, "unknown"
 
     async def _filter_valid_people(
         self, people: list[LinkedInPerson], company: str
     ) -> list[LinkedInPerson]:
-        """Filter out false positives using OpenAI validation."""
+        """Filter out false positives and tag recency using OpenAI validation."""
         if not people:
             return []
-        
+
         logger.info("Validating %d profiles...", len(people))
         validation_tasks = [
             self._validate_person_works_at_company(p, company) for p in people
         ]
         validations = await asyncio.gather(*validation_tasks)
-        
-        valid_people = [p for p, is_valid in zip(people, validations) if is_valid]
+
+        valid_people = []
+        for p, (works_here, recency) in zip(people, validations):
+            if works_here:
+                p.profile_recency = recency
+                valid_people.append(p)
+
         filtered_count = len(people) - len(valid_people)
-        
         if filtered_count > 0:
             logger.info("Filtered out %d/%d false positives", filtered_count, len(people))
-        
+
         return valid_people
 
-    # ── Main pipeline ────────────────────────────────────────────────────
+    # ── Main pipeline ────────────────────────────────────────────────
 
     @staticmethod
     def _normalize_linkedin_url(url: str) -> str:
@@ -285,12 +392,22 @@ Answer with ONLY "yes" or "no".
         target_count: int = 8,
         job_context: dict | None = None,
         exclude_linkedin_urls: set[str] | None = None,
+        user_profile: "UserProfile | None" = None,
+        job_url: str | None = None,
     ) -> list[Person]:
         """Find relevant people at a company for a given role.
 
-        With Serper API: 5 queries → 30–40 raw → hard filter → validation → scoring → diversity selection.
-        job_context from a job posting URL makes queries and scoring team-specific.
-        exclude_linkedin_urls: optional set of LinkedIn URLs (or normalized) to skip (e.g. already have).
+        With Serper API: dynamic tiered queries → hard filter → warm signal cross-reference →
+        validation (with recency) → scoring (dual-axis) → dynamic diversity selection.
+
+        Args:
+            company: Target company name.
+            role: Role being applied for.
+            target_count: Number of final contacts to return.
+            job_context: Optional dict from job_analyzer.
+            exclude_linkedin_urls: Optional set of LinkedIn URLs to skip.
+            user_profile: Optional UserProfile for warm-path matching.
+            job_url: Optional job posting URL for tier-1 queries.
         """
         exclude = set()
         if exclude_linkedin_urls:
@@ -299,8 +416,8 @@ Answer with ONLY "yes" or "no".
                 if n:
                     exclude.add(n)
         if settings.serper_api_key:
-            return await self._find_people_serper(company, role, target_count, job_context, exclude)
-        return await self._find_people_browser(company, role, target_count, job_context, exclude)
+            return await self._find_people_serper(company, role, target_count, job_context, exclude, user_profile, job_url)
+        return await self._find_people_browser(company, role, target_count, job_context, exclude, user_profile)
 
     async def _find_people_serper(
         self,
@@ -309,9 +426,11 @@ Answer with ONLY "yes" or "no".
         target_count: int,
         job_context: dict | None = None,
         exclude_urls: set[str] | None = None,
+        user_profile: "UserProfile | None" = None,
+        job_url: str | None = None,
     ) -> list[Person]:
-        """Wide-net pipeline: Serper → hard filter → validation → scoring → diversity selection."""
-        all_people = await self.search_serper_wide(company, role, job_context)
+        """Wide-net pipeline: dynamic queries → hard filter → warm signals → validation → scoring → diversity selection."""
+        all_people = await self.search_serper_wide(company, role, job_context, user_profile, job_url)
         if not all_people:
             logger.warning("Serper returned no candidates for %s", company)
             return []
@@ -328,6 +447,9 @@ Answer with ONLY "yes" or "no".
         if not all_people:
             return []
 
+        # Cross-reference warm signals before validation
+        all_people = self._cross_reference_warm_signals(all_people, user_profile)
+
         all_people = await self._filter_valid_people(all_people, company)
         logger.info("After validation: %d confirmed employees", len(all_people))
         if not all_people:
@@ -341,11 +463,13 @@ Answer with ONLY "yes" or "no".
                 linkedin_url=lp.linkedin_url,
                 recent_activity=lp.recent_activity,
                 profile_summary=lp.recent_activity,
+                discovery_source=lp.discovery_source,
+                warm_signals=lp.warm_signals,
             )
             for lp in all_people
         ]
 
-        logger.info("Scoring %d people for reply likelihood...", len(people))
+        logger.info("Scoring %d people (dual-axis: influence + reachability)...", len(people))
         scored = await score_people(people, role, company, job_context=job_context)
         final = select_final_contacts(scored, target=target_count)
         logger.info("People finder complete: %d final contacts for %s", len(final), company)
@@ -358,8 +482,9 @@ Answer with ONLY "yes" or "no".
         target_count: int,
         job_context: dict | None = None,
         exclude_urls: set[str] | None = None,
+        user_profile: "UserProfile | None" = None,
     ) -> list[Person]:
-        """Fallback: Browser Use (2 tasks) → validation → scoring → diversity selection."""
+        """Fallback: Browser Use (2 tasks) → warm signals → validation → scoring → diversity selection."""
         team_keyword = self._extract_team_keyword(role)
         logger.info("Searching for %s recruiters and %s %s (concurrent)...", company, company, team_keyword)
         recruiter_task = self.search_google_for_linkedin(company, "recruiter")
@@ -387,6 +512,10 @@ Answer with ONLY "yes" or "no".
             ]
             logger.info("After excluding existing: %d candidates", len(all_people))
         all_people = [p for p in all_people if hard_filter(p, role)]
+
+        # Cross-reference warm signals
+        all_people = self._cross_reference_warm_signals(all_people, user_profile)
+
         all_people = await self._filter_valid_people(all_people, company)
 
         people = [
@@ -397,17 +526,19 @@ Answer with ONLY "yes" or "no".
                 linkedin_url=lp.linkedin_url,
                 recent_activity=lp.recent_activity,
                 profile_summary=lp.recent_activity,
+                discovery_source=lp.discovery_source,
+                warm_signals=lp.warm_signals,
             )
             for lp in all_people
         ]
 
-        logger.info("Scoring %d people for relevance to '%s'...", len(people), role)
+        logger.info("Scoring %d people (dual-axis: influence + reachability)...", len(people))
         scored = await score_people(people, role, company, job_context=job_context)
         final = select_final_contacts(scored, target=target_count)
         logger.info("People finder complete: %d final contacts for %s", len(final), company)
         return final
 
-    # ── Helpers ──────────────────────────────────────────────────────────
+    # ── Helpers ──────────────────────────────────────────────────────
 
     def _parse_people_from_output(self, output: str) -> list[LinkedInPerson]:
         """Parse Browser Use output into LinkedInPerson objects."""
@@ -467,7 +598,7 @@ Answer with ONLY "yes" or "no".
         return None
 
     def _deduplicate(self, people: list[LinkedInPerson]) -> list[LinkedInPerson]:
-        """Remove duplicate people based on LinkedIn URL or name."""
+        """Remove duplicate people based on LinkedIn URL or name. Preserve earliest discovery_source."""
         seen_urls: set[str] = set()
         seen_names: set[str] = set()
         unique: list[LinkedInPerson] = []

@@ -1,3 +1,4 @@
+import logging
 import uuid
 from contextlib import asynccontextmanager
 
@@ -6,7 +7,20 @@ from datetime import datetime, timezone
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
-from backend.models.schemas import ActivityLogEntry, SearchRequest, SearchResult, SearchStatus
+# ── Configure logging so all backend.* logger.info() calls print to terminal ──
+logging.basicConfig(
+    level=logging.INFO,
+    format="\033[90m%(asctime)s\033[0m %(levelname)s \033[1m%(name)s\033[0m  %(message)s",
+    datefmt="%H:%M:%S",
+)
+# Quiet noisy third-party loggers
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("openai").setLevel(logging.WARNING)
+logging.getLogger("urllib3").setLevel(logging.WARNING)
+logging.getLogger("firecrawl").setLevel(logging.WARNING)
+
+from backend.models.schemas import ActivityLogEntry, SearchRequest, SearchResult, SearchStatus, UserProfileDoc
 from backend.db.mongodb import (
     connect_mongodb,
     close_mongodb,
@@ -14,10 +28,14 @@ from backend.db.mongodb import (
     get_job,
     save_job,
     list_jobs as db_list_jobs,
+    get_profile as db_get_profile,
+    save_profile as db_save_profile,
+    delete_profile as db_delete_profile,
 )
 
 # In-memory fallback when MongoDB is not configured
 jobs: dict[str, SearchResult] = {}
+profiles: dict[str, dict] = {}
 job_websockets: dict[str, list[WebSocket]] = {}
 
 
@@ -32,6 +50,26 @@ async def _save_job(result: SearchResult) -> None:
         await save_job(result)
     else:
         jobs[result.job_id] = result
+
+
+async def _get_profile(profile_id: str = "default") -> dict | None:
+    if get_db() is not None:
+        return await db_get_profile(profile_id)
+    return profiles.get(profile_id)
+
+
+async def _save_profile(doc: dict) -> None:
+    if get_db() is not None:
+        await db_save_profile(doc)
+    else:
+        profiles[doc.get("profile_id", "default")] = doc
+
+
+async def _delete_profile(profile_id: str = "default") -> None:
+    if get_db() is not None:
+        await db_delete_profile(profile_id)
+    else:
+        profiles.pop(profile_id, None)
 
 
 @asynccontextmanager
@@ -59,6 +97,38 @@ app.add_middleware(
 @app.get("/health")
 async def health_check():
     return {"status": "ok"}
+
+
+# ── Profile endpoints ────────────────────────────────────────────────────
+
+@app.get("/api/profile")
+async def get_user_profile():
+    """Get the saved user profile (returns null if none exists)."""
+    doc = await _get_profile("default")
+    return doc
+
+
+@app.put("/api/profile")
+async def save_user_profile(profile: UserProfileDoc):
+    """Create or update the user profile."""
+    now = datetime.now(timezone.utc).isoformat()
+    doc = profile.model_dump()
+    doc["profile_id"] = "default"
+    doc["updated_at"] = now
+    existing = await _get_profile("default")
+    if existing and existing.get("created_at"):
+        doc["created_at"] = existing["created_at"]
+    else:
+        doc["created_at"] = now
+    await _save_profile(doc)
+    return doc
+
+
+@app.delete("/api/profile")
+async def delete_user_profile():
+    """Delete the user profile."""
+    await _delete_profile("default")
+    return {"status": "deleted"}
 
 
 # ── Search endpoints ─────────────────────────────────────────────────────

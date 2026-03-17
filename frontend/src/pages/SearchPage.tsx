@@ -1,5 +1,6 @@
-import { useState } from 'react';
-import { startSearch } from '../services/api';
+import { useState, useEffect } from 'react';
+import { startSearch, getProfile } from '../services/api';
+import type { UserProfileDoc } from '../services/api';
 
 interface Props {
   onSearchStarted: (jobId: string) => void;
@@ -13,9 +14,20 @@ export default function SearchPage({ onSearchStarted }: Props) {
   const [role, setRole] = useState('');
   const [jobUrl, setJobUrl] = useState('');
   const [linkedinUrl, setLinkedinUrl] = useState('');
+  const [resumeUrl, setResumeUrl] = useState('');
   const [companyWebsite, setCompanyWebsite] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  const [savedProfile, setSavedProfile] = useState<UserProfileDoc | null>(null);
+
+  useEffect(() => {
+    getProfile().then((p) => setSavedProfile(p));
+  }, []);
+
+  const hasProfile = savedProfile && (
+    (savedProfile.universities && savedProfile.universities.length > 0) ||
+    (savedProfile.previous_companies && savedProfile.previous_companies.length > 0)
+  );
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
@@ -29,7 +41,12 @@ export default function SearchPage({ onSearchStarted }: Props) {
         company: company.trim(),
         role: role.trim(),
         job_url: jobUrl.trim() || undefined,
-        linkedin_url: linkedinUrl.trim() || undefined,
+        linkedin_url: hasProfile
+          ? savedProfile!.linkedin_url || undefined
+          : linkedinUrl.trim() || undefined,
+        resume_url: hasProfile
+          ? savedProfile!.resume_url || undefined
+          : resumeUrl.trim() || undefined,
         company_website: companyWebsite.trim() || undefined,
       });
       onSearchStarted(job_id);
@@ -108,19 +125,44 @@ export default function SearchPage({ onSearchStarted }: Props) {
           />
         </div>
 
-        <div>
-          <label className="block text-sm font-medium text-gray-700 mb-1.5">
-            Your LinkedIn URL
-            <span className="text-gray-400 font-normal ml-1">(optional)</span>
-          </label>
-          <input
-            type="url"
-            value={linkedinUrl}
-            onChange={(e) => setLinkedinUrl(e.target.value)}
-            placeholder="https://linkedin.com/in/yourprofile"
-            className={inputClass}
-          />
-        </div>
+        {hasProfile ? (
+          <div className="rounded-lg border border-green-200 bg-green-50 px-4 py-3">
+            <p className="text-sm text-green-800">
+              Using your saved profile for warm connections
+              {savedProfile!.name ? ` (${savedProfile!.name})` : ''}.
+            </p>
+          </div>
+        ) : (
+          <>
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1.5">
+                Your LinkedIn URL
+                <span className="text-gray-400 font-normal ml-1">(optional — enables warm connections)</span>
+              </label>
+              <input
+                type="url"
+                value={linkedinUrl}
+                onChange={(e) => setLinkedinUrl(e.target.value)}
+                placeholder="https://linkedin.com/in/yourprofile"
+                className={inputClass}
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1.5">
+                Resume URL
+                <span className="text-gray-400 font-normal ml-1">(optional — enables warm connections)</span>
+              </label>
+              <input
+                type="url"
+                value={resumeUrl}
+                onChange={(e) => setResumeUrl(e.target.value)}
+                placeholder="https://drive.google.com/file/d/..."
+                className={inputClass}
+              />
+            </div>
+          </>
+        )}
 
         {error && (
           <p className="text-sm text-red-600">{error}</p>
@@ -131,7 +173,7 @@ export default function SearchPage({ onSearchStarted }: Props) {
           disabled={loading || !company.trim() || !role.trim()}
           className="w-full rounded-lg bg-gray-900 hover:bg-gray-800 disabled:bg-gray-200 disabled:text-gray-400 text-white px-4 py-3 text-sm font-medium transition-colors cursor-pointer disabled:cursor-not-allowed"
         >
-          {loading ? 'Starting…' : 'Find contacts'}
+          {loading ? 'Starting...' : 'Find contacts'}
         </button>
       </form>
     </div>
