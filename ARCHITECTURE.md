@@ -6,11 +6,13 @@
 
 1. Analyzes the job posting to identify the exact team, tech stack, hiring contacts, email domain, and reporting structure
 2. Loads your persistent profile (or extracts it from LinkedIn/resume) for warm-path matching
-3. Finds 6-8 high-value contacts using tiered, context-aware search queries (with quality threshold filtering)
-4. Scores each contact on two axes: **influence** (hiring power) and **reachability** (likelihood to respond)
-5. Discovers email addresses with confidence levels (verified, pattern-matched, or guessed) — boosted by domain extracted from job posting
-6. Researches the company for personalization context
-7. Generates personalized cold emails with specific outreach angles per contact
+3. Scrapes company team/about pages to extract named contacts as seed candidates (Step 0.7)
+4. Finds 6-8 high-value contacts using tiered, context-aware search queries (with quality threshold filtering)
+5. Scores each contact on two axes: **influence** (hiring power) and **reachability** (likelihood to respond), with verifiable GitHub presence as a concrete bonus signal
+6. Discovers email addresses with confidence levels (verified, pattern-matched, or guessed) — boosted by domain extracted from job posting
+7. Researches the company for personalization context (reusing pages already scraped in Step 0.7)
+8. Generates personalized cold emails with specific outreach angles per contact
+9. Tracks outreach outcomes — sent date, replies, and results per contact for future learning
 
 The philosophy: **precision over volume**. A reachable person with moderate influence beats an unreachable person with high influence. Six strong contacts beat eight with filler. Outreach angles are labeled as "verified" or "suggested" so users know what's backed by data vs. inference.
 
@@ -96,6 +98,7 @@ OPENAI_API_KEY=           # Required - powers all LLM features
 BROWSER_USE_API_KEY=      # Optional - Browser Use Cloud for web automation
 FIRECRAWL_API_KEY=        # Optional - Firecrawl for web scraping
 SERPER_API_KEY=           # Optional - Serper for Google search (~$0.001/query)
+GITHUB_TOKEN=             # Optional - increases GitHub API rate limit (10→60 req/min) for presence checks
 AGENTMAIL_API_KEY=        # Reserved for future email sending
 LANGFUSE_PUBLIC_KEY=      # Optional - observability
 LANGFUSE_SECRET_KEY=      # Optional - observability
@@ -119,10 +122,11 @@ All external APIs degrade gracefully — if a key is missing, the system uses fa
 | `POST` | `/api/search/{job_id}/more-leads` | Find additional contacts for an existing campaign |
 | `POST` | `/api/email/generate` | Generate a personalized email for one contact |
 | `PUT` | `/api/email/edit` | Save edits to an email draft |
+| `POST` | `/api/email/outcome` | Track sent/replied/outcome status for a draft (matched by name + email) |
 | `GET` | `/api/profile` | Get the saved user profile (returns `null` if none) |
 | `PUT` | `/api/profile` | Create/update the persistent user profile |
 | `DELETE` | `/api/profile` | Delete the saved user profile |
-| `GET` | `/api/history` | List all past campaigns |
+| `GET` | `/api/history` | List all past campaigns (includes `sent_count` and `replied_count` per campaign) |
 | `GET` | `/health` | Health check |
 
 ### WebSocket
@@ -179,6 +183,7 @@ outreach_angle: string            # Specific, actionable reason to contact this 
 angle_confidence: string          # "verified" (backed by data) | "suggested" (LLM inference)
 warm_signals: string[]            # e.g. ["same_university:UVA", "shared_job_posting", "recently_joined"]
 discovery_source: string          # "job_posting_sharer" | "hiring_manager" | "team_search" | "warm_path" | "recruiter" | "general"
+has_public_github: bool           # True if a matching GitHub profile was found (engineers/ICs only)
 ```
 
 ### EmailResult
@@ -198,6 +203,9 @@ subject: string
 body: string
 tone: string
 personalization_notes: string
+sent_at: string | null            # ISO datetime when user marked the email as sent
+replied: bool | null              # True = got a reply, False = no response, null = not yet tracked
+outcome: string | null            # "no_response" | "replied" | "referral" | "interview"
 ```
 
 ### UserProfileDoc (persistent — saved once, reused across campaigns)
@@ -242,11 +250,16 @@ User Input (company, role, job_url?, linkedin_url?, resume_url?)
     │     Saved profile (DB) → or extract from LinkedIn/resume →
     │     Universities, companies, skills → warm-path matching
     │
+    ├──── Step 0.7: Team Page Scraping (if company_website or email_domain known)
+    │     Scrape /about + /team → Extract names+titles via OpenAI →
+    │     Seed candidates injected as tier-1 queries → page_cache passed to Step 3
+    │
     ├──── Step 1: Find People (PeopleFinder)
-    │     Build tiered queries (incl. reporting manager) → Serper search →
+    │     Build tiered queries (incl. seed names, reporting manager) → Serper search →
     │     Hard filter → Cross-reference warm signals → Validate (with recency) →
+    │     GitHub presence check (engineers only, before scoring) →
     │     Dual-axis scoring + angle confidence → Quality threshold (≥0.60) →
-    │     Dynamic diversity selection → 6-8 contacts
+    │     Dynamic diversity selection (with org-level deduplication) → 6-8 contacts
     │
     ├──── Step 2: Find Emails (EmailFinder)
     │     Domain discovery → GitHub org pattern detection →
@@ -254,7 +267,7 @@ User Input (company, role, job_url?, linkedin_url?, resume_url?)
     │     Confidence assignment (boosted by job posting domain)
     │
     ├──── Step 3: Research Company (EmailWriter)
-    │     Scrape /about, /blog, /careers →
+    │     Reuse page_cache from Step 0.7 → Scrape /blog, /careers →
     │     Summarize mission, news, culture
     │
     └──── COMPLETED
@@ -263,6 +276,10 @@ User Input (company, role, job_url?, linkedin_url?, resume_url?)
          Step 4: Generate Email (on-demand)
               Detect recipient type → Inject context →
               Enforce variety → Return draft
+
+              ▼  (User clicks "Copy" then "Did you send this?")
+         Outcome Tracking (user-driven)
+              Mark sent → Mark replied/no-response → Aggregate stats on History page
 ```
 
 ### Step 0: Job Analysis (`job_analyzer.py`)
