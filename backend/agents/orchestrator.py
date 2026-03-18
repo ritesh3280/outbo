@@ -23,7 +23,7 @@ from backend.tools.browser import BrowserTool
 from backend.tools.scraper import ScraperTool
 from backend.agents.people_finder import PeopleFinder
 from backend.agents.email_finder import EmailFinder
-from backend.agents.email_writer import research_company
+from backend.agents.email_writer import research_company, scrape_team_pages
 from backend.agents.job_analyzer import analyze_job_posting
 from backend.agents.user_profile_extractor import extract_user_profile, user_profile_from_doc, UserProfile
 
@@ -175,6 +175,31 @@ async def run_search(
     else:
         logger.info("[Step 0.5] No saved profile and no URLs — skipping warm path")
 
+    # ── Step 0.7: Scrape team/about pages for seed candidates ─────────
+    seed_candidates: list[dict] = []
+    page_cache: dict[str, str] = {}
+    company_base_url = request.company_website or (
+        f"https://{job_context['email_domain']}"
+        if job_context and job_context.get("email_domain")
+        else None
+    )
+    if company_base_url:
+        step_start = time.time()
+        logger.info("[Step 0.7] Scraping team pages at %s", company_base_url)
+        try:
+            seed_candidates, page_cache = await scrape_team_pages(
+                company=request.company,
+                base_url=company_base_url,
+                department=(job_context or {}).get("department", ""),
+                scraper=scraper,
+            )
+            logger.info("[Step 0.7] Done in %.1fs — %d seed candidates", time.time() - step_start, len(seed_candidates))
+            if seed_candidates:
+                names = ", ".join(c["name"] for c in seed_candidates[:5])
+                await update(f"Found {len(seed_candidates)} contacts from company team page: {names}")
+        except Exception as e:
+            logger.warning("[Step 0.7] Team page scraping failed: %s", e)
+
     # ── Step 1: Find people ──────────────────────────────────────────
     result.status = SearchStatus.FINDING_PEOPLE
     await update(f"Searching for contacts at {request.company}...")
@@ -190,6 +215,7 @@ async def run_search(
             job_context=job_context,
             user_profile=user_profile,
             job_url=request.job_url,
+            seed_candidates=seed_candidates if seed_candidates else None,
         )
         result.people = people
         logger.info("[Step 1] Done in %.1fs — %d contacts selected:", time.time() - step_start, len(people))
@@ -251,6 +277,7 @@ async def run_search(
             company=request.company,
             role=request.role,
             scraper=scraper,
+            page_cache=page_cache if page_cache else None,
         )
         logger.info("[Step 3] Done in %.1fs", time.time() - step_start)
         if company_context:

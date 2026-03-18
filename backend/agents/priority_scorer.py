@@ -124,6 +124,7 @@ async def score_people(
             "profile_summary": p.profile_summary[:200] if p.profile_summary else "",
             "warm_signals": p.warm_signals if p.warm_signals else [],
             "discovery_source": p.discovery_source or "general",
+            "has_public_github": p.has_public_github,
         }
         for p in people
     ]
@@ -219,6 +220,18 @@ async def score_people(
                     elif signal == "recently_joined":
                         reachability = min(100, reachability + 8)
 
+                # GitHub presence bonus: +10 for engineers/ICs (not recruiters/managers)
+                title_lower = person.title.lower()
+                is_engineer_ic = (
+                    person.has_public_github
+                    and "recruiter" not in title_lower
+                    and "talent" not in title_lower
+                    and "manager" not in title_lower
+                    and "director" not in title_lower
+                )
+                if is_engineer_ic:
+                    reachability = min(100, reachability + 10)
+
                 composite = 0.4 * influence + 0.6 * reachability
                 person.priority_score = max(0.0, min(1.0, composite / 100.0))
                 person.influence_score = influence / 100.0
@@ -286,6 +299,10 @@ def _heuristic_score(people: list[Person], role: str) -> list[Person]:
                 reachability = min(100, reachability + 10)
             elif signal == "recently_joined":
                 reachability = min(100, reachability + 8)
+
+        # GitHub presence bonus for engineers/ICs
+        if person.has_public_github and "recruiter" not in title_lower and "manager" not in title_lower:
+            reachability = min(100, reachability + 10)
 
         composite = 0.4 * influence + 0.6 * reachability
         person.priority_score = round(min(1.0, composite / 100.0), 2)

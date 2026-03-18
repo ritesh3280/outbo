@@ -13,6 +13,8 @@ import asyncio
 import json
 import logging
 import re
+import unicodedata
+from collections import defaultdict
 from typing import TYPE_CHECKING
 
 from openai import AsyncOpenAI
@@ -98,6 +100,44 @@ def hard_filter(person: LinkedInPerson, role: str) -> bool:
 QUALITY_THRESHOLD = 0.60
 
 
+def _normalize_title(title: str) -> str:
+    """Strip emojis and special characters from a title for level inference."""
+    cleaned = []
+    for c in title:
+        cp = ord(c)
+        # Keep ASCII and standard Latin chars; drop emoji/symbol ranges
+        if cp < 0x2000:
+            cleaned.append(c)
+        elif unicodedata.category(c) in ("Ll", "Lu", "Lt", "Lm", "Lo"):
+            cleaned.append(c)
+        else:
+            cleaned.append(" ")
+    return " ".join("".join(cleaned).split()).lower()
+
+
+def _infer_level(title: str) -> int:
+    """Infer organizational level from a title string.
+
+    Returns:
+        0 = IC (individual contributor / engineer)
+        1 = manager / lead
+        2 = senior manager
+        3 = director or above
+    """
+    t = _normalize_title(title)
+    if any(w in t for w in ["director", "vp ", "vice president", "head of", "chief"]):
+        return 3
+    if any(w in t for w in ["senior engineering manager", "senior manager", "staff em", "principal manager"]):
+        return 2
+    # "engineering manager" or "team lead" / "tech lead" → level 1
+    has_manager = any(w in t for w in ["engineering manager", "tech lead", "team lead", "engineering lead"])
+    # Standalone "lead" only if not next to "developer" or "engineer" (which implies IC lead)
+    has_lead_only = " lead" in t and "developer" not in t and "engineer" not in t
+    if has_manager or has_lead_only:
+        return 1
+    return 0
+
+
 def select_final_contacts(
     scored_people: list[Person],
     target: int = 8,
@@ -160,6 +200,43 @@ def select_final_contacts(
         cat_people = [p for p in scored_people if p.contact_category == cat and p.name not in selected_set]
         if cat_people:
             _add(cat_people[0])
+
+    # Step 2.5: Org-level diversity within the same contact_category
+    # If ≥2 selected contacts share the same category AND the same inferred level,
+    # try to swap the weakest same-level duplicate for a different-level candidate
+    # (only if the replacement scores within 15% of the one being replaced).
+    selected_by_cat: dict[str, list[Person]] = defaultdict(list)
+    for p in selected:
+        if p.contact_category:
+            selected_by_cat[p.contact_category].append(p)
+
+    for cat, cat_selected in selected_by_cat.items():
+        if len(cat_selected) < 2:
+            continue
+        levels = [_infer_level(p.title) for p in cat_selected]
+        if len(set(levels)) > 1:
+            continue  # already diverse
+        # All same level — try to find a different-level candidate from unselected pool
+        same_cat_unselected = [
+            p for p in scored_people
+            if p.contact_category == cat and p.name not in selected_set
+        ]
+        for candidate in same_cat_unselected:
+            if _infer_level(candidate.title) == levels[0]:
+                continue  # still same level, skip
+            # Swap out the lowest-scoring duplicate (keep the best one)
+            to_remove = min(cat_selected[1:], key=lambda p: p.priority_score)
+            if candidate.priority_score >= to_remove.priority_score * 0.85:
+                selected.remove(to_remove)
+                selected_set.discard(to_remove.name)
+                _add(candidate)
+                logger.info(
+                    "Org diversity: swapped %s (level %d, %.2f) for %s (level %d, %.2f) in category '%s'",
+                    to_remove.name, _infer_level(to_remove.title), to_remove.priority_score,
+                    candidate.name, _infer_level(candidate.title), candidate.priority_score,
+                    cat,
+                )
+                break
 
     # Step 3: Ensure at least 2 warm connections if available
     warm_in_selected = sum(1 for p in selected if p.warm_signals)
@@ -229,6 +306,7 @@ class PeopleFinder:
         job_context: dict | None = None,
         user_profile: "UserProfile | None" = None,
         job_url: str | None = None,
+        seed_candidates: list[dict] | None = None,
     ) -> list[LinkedInPerson]:
         """Run dynamic tiered Serper queries concurrently, return aggregated LinkedIn profiles."""
         team_keyword = self._extract_team_keyword(role)
@@ -239,6 +317,31 @@ class PeopleFinder:
             job_url=job_url,
             role_keyword=team_keyword,
         )
+
+        # Inject seed candidates from team page scraping as tier-1 queries (cap at 3)
+        if seed_candidates:
+            from backend.agents.job_analyzer import QueryGroup
+            seed_queries: list[QueryGroup] = []
+            for candidate in seed_candidates[:3]:
+                name = (candidate.get("name") or "").strip()
+                if name:
+                    seed_queries.append(QueryGroup(
+                        query=f'site:linkedin.com/in "{name}" "{company}"',
+                        category="hiring_manager",
+                        priority=1,
+                    ))
+            if seed_queries:
+                logger.info("Injecting %d seed candidate queries from team page", len(seed_queries))
+                # Insert before existing queries, preserve sort order
+                query_groups = seed_queries + query_groups
+                query_groups.sort(key=lambda q: q.priority)
+                # Re-apply cap (12 for intern, otherwise 10 — use existing cap logic)
+                jc = job_context or {}
+                is_intern = (jc.get("seniority") or "").lower() == "intern"
+                cap = 12 if is_intern else 10
+                cap += len(seed_queries)  # Expand cap to accommodate seeds without pushing out existing queries
+                query_groups = query_groups[:cap]
+
         logger.info("Running %d Serper queries for %s...", len(query_groups), company)
 
         for i, qg in enumerate(query_groups, 1):
@@ -420,6 +523,49 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
 
         return valid_people
 
+    # ── GitHub presence check ─────────────────────────────────────────
+
+    async def _check_github_presence_batch(self, people: list["Person"], company: str) -> None:
+        """Set has_public_github=True on engineers/managers who have a matching GitHub profile.
+
+        Runs checks sequentially with a small delay to stay within unauthenticated rate limit
+        (10 req/min). With GITHUB_TOKEN set, runs concurrently (60 req/min).
+        """
+        from backend.agents.email_finder import check_github_presence
+
+        non_recruiters = [
+            p for p in people
+            if "recruiter" not in p.title.lower() and "talent" not in p.title.lower()
+        ]
+        if not non_recruiters:
+            return
+
+        logger.info("Checking GitHub presence for %d engineer/manager candidates...", len(non_recruiters))
+
+        if settings.github_token:
+            # Authenticated: run concurrently
+            results = await asyncio.gather(
+                *[check_github_presence(p.name, company) for p in non_recruiters],
+                return_exceptions=True,
+            )
+            for person, has_gh in zip(non_recruiters, results):
+                if has_gh is True:
+                    person.has_public_github = True
+        else:
+            # Unauthenticated: run with small delay to stay within 10 req/min
+            for person in non_recruiters:
+                try:
+                    has_gh = await check_github_presence(person.name, company)
+                    if has_gh:
+                        person.has_public_github = True
+                    await asyncio.sleep(0.15)  # ~6-7 checks/min safety margin
+                except Exception:
+                    pass
+
+        gh_count = sum(1 for p in non_recruiters if p.has_public_github)
+        if gh_count:
+            logger.info("GitHub: %d/%d candidates have public GitHub profiles", gh_count, len(non_recruiters))
+
     # ── Main pipeline ────────────────────────────────────────────────
 
     @staticmethod
@@ -439,6 +585,7 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
         exclude_linkedin_urls: set[str] | None = None,
         user_profile: "UserProfile | None" = None,
         job_url: str | None = None,
+        seed_candidates: list[dict] | None = None,
     ) -> list[Person]:
         """Find relevant people at a company for a given role.
 
@@ -453,6 +600,7 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
             exclude_linkedin_urls: Optional set of LinkedIn URLs to skip.
             user_profile: Optional UserProfile for warm-path matching.
             job_url: Optional job posting URL for tier-1 queries.
+            seed_candidates: Optional list of {name, title} dicts from team page scraping.
         """
         exclude = set()
         if exclude_linkedin_urls:
@@ -461,7 +609,7 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
                 if n:
                     exclude.add(n)
         if settings.serper_api_key:
-            return await self._find_people_serper(company, role, target_count, job_context, exclude, user_profile, job_url)
+            return await self._find_people_serper(company, role, target_count, job_context, exclude, user_profile, job_url, seed_candidates)
         return await self._find_people_browser(company, role, target_count, job_context, exclude, user_profile)
 
     async def _find_people_serper(
@@ -473,9 +621,10 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
         exclude_urls: set[str] | None = None,
         user_profile: "UserProfile | None" = None,
         job_url: str | None = None,
+        seed_candidates: list[dict] | None = None,
     ) -> list[Person]:
         """Wide-net pipeline: dynamic queries → hard filter → warm signals → validation → scoring → diversity selection."""
-        all_people = await self.search_serper_wide(company, role, job_context, user_profile, job_url)
+        all_people = await self.search_serper_wide(company, role, job_context, user_profile, job_url, seed_candidates)
         if not all_people:
             logger.warning("Serper returned no candidates for %s", company)
             return []
@@ -513,6 +662,10 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
             )
             for lp in all_people
         ]
+
+        # ── GitHub presence check (before scoring so scorer can factor it in) ──
+        # Only for engineers/managers (not recruiters). Respects rate limits.
+        await self._check_github_presence_batch(people, company)
 
         logger.info("Scoring %d people (dual-axis: influence + reachability)...", len(people))
         scored = await score_people(people, role, company, job_context=job_context)

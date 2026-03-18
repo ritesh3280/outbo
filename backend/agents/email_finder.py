@@ -457,6 +457,61 @@ async def find_github_email(person_name: str, company: str) -> str | None:
     return None
 
 
+async def check_github_presence(person_name: str, company: str) -> bool:
+    """Return True if a GitHub profile matching name + company is found (even without a public email).
+
+    Uses the GitHub Search API. Authenticates via GITHUB_TOKEN if set (60 req/min),
+    otherwise unauthenticated (10 req/min).
+    """
+    query = f"{person_name} {company}"
+    headers: dict[str, str] = {"Accept": "application/vnd.github.v3+json"}
+    if settings.github_token:
+        headers["Authorization"] = f"token {settings.github_token}"
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.github.com/search/users",
+                params={"q": query, "per_page": 3},
+                headers=headers,
+                timeout=10.0,
+            )
+
+            if response.status_code == 403:
+                logger.debug("GitHub API rate limited during presence check")
+                return False
+            if response.status_code != 200:
+                return False
+
+            data = response.json()
+            items = data.get("items", [])
+            if not items:
+                return False
+
+            company_lower = company.lower()
+            for user in items:
+                login = user.get("login", "")
+                user_resp = await client.get(
+                    f"https://api.github.com/users/{login}",
+                    headers=headers,
+                    timeout=10.0,
+                )
+                if user_resp.status_code != 200:
+                    continue
+                user_data = user_resp.json()
+                bio = (user_data.get("bio") or "").lower()
+                user_company = (user_data.get("company") or "").lower()
+                # Verify company match
+                if company_lower in user_company or company_lower in bio or f"@{company_lower}" in user_company:
+                    logger.debug("GitHub presence confirmed for %s at %s (login: %s)", person_name, company, login)
+                    return True
+
+    except Exception as e:
+        logger.debug("GitHub presence check failed for %s: %s", person_name, e)
+
+    return False
+
+
 # ── Main Email Finder ────────────────────────────────────────────────────
 
 

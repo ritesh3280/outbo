@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     # Serper (Google Search API — cheap, for wide-net people search)
     serper_api_key: str = ""
 
+    # GitHub (optional — increases API rate limit from 10 to 60 req/min)
+    github_token: str = ""
+
     # AgentMail
     agentmail_api_key: str = ""
 

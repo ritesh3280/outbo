@@ -66,6 +66,23 @@ export async function editEmail(params: {
   return response.json();
 }
 
+export async function markOutcome(params: {
+  job_id: string;
+  name: string;
+  email: string;
+  sent_at?: string;
+  replied?: boolean;
+  outcome?: string;
+}): Promise<{ status: string }> {
+  const response = await fetch(`${API_BASE}/api/email/outcome`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(params),
+  });
+  if (!response.ok) throw new Error(`Outcome update failed: ${response.status}`);
+  return response.json();
+}
+
 export async function getHistory(): Promise<HistoryEntry[]> {
   const response = await fetch(`${API_BASE}/api/history`);
   if (!response.ok) throw new Error(`History failed: ${response.status}`);
@@ -90,6 +107,7 @@ export interface Person {
   warm_signals: string[];
   discovery_source: string;
   angle_confidence: string;
+  has_public_github?: boolean;
 }
 
 export interface EmailResult {
@@ -107,6 +125,9 @@ export interface EmailDraft {
   body: string;
   tone: string;
   personalization_notes: string;
+  sent_at?: string | null;
+  replied?: boolean | null;
+  outcome?: string | null;
 }
 
 export interface ActivityLogEntry {
@@ -134,6 +155,8 @@ export interface HistoryEntry {
   status: string;
   people_count: number;
   drafts_count: number;
+  sent_count: number;
+  replied_count: number;
 }
 
 export interface UserProfileDoc {

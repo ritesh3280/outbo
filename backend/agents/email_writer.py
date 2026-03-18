@@ -9,6 +9,7 @@ Handles:
 import asyncio
 import json
 import logging
+import re
 
 from openai import AsyncOpenAI
 from pydantic import BaseModel
@@ -47,10 +48,94 @@ def _is_error_page(result) -> bool:
     return False
 
 
+_MIN_NAME_PATTERNS = 5  # Minimum person-name patterns before calling OpenAI
+
+
+async def scrape_team_pages(
+    company: str,
+    base_url: str,
+    department: str,
+    scraper: ScraperTool | None = None,
+) -> tuple[list[dict], dict[str, str]]:
+    """Scrape company /about and /team pages to extract names + titles.
+
+    Returns:
+        (candidates, page_cache)
+        candidates: [{"name": "...", "title": "..."}] filtered to department-relevant roles
+        page_cache: {url: content} for reuse in research_company() to avoid double-scraping
+    """
+    scraper = scraper or ScraperTool()
+    # Normalize base_url
+    if not base_url.startswith("http"):
+        base_url = f"https://{base_url}"
+    base_url = base_url.rstrip("/")
+
+    urls = [f"{base_url}/about", f"{base_url}/team"]
+    logger.info("[Step 0.7] Scraping team pages for %s: %s", company, urls)
+
+    results = await scraper.scrape_multiple(urls)
+    page_cache: dict[str, str] = {}
+    combined_text = ""
+
+    for r in results:
+        if r.success and r.content and not _is_error_page(r):
+            page_cache[r.url] = r.content
+            # Quick heuristic: count capitalized two-word sequences (likely person names)
+            name_patterns = re.findall(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', r.content)
+            if len(name_patterns) < _MIN_NAME_PATTERNS:
+                logger.info("[Step 0.7] Skipping %s — only %d name patterns found", r.url, len(name_patterns))
+                continue
+            combined_text += f"\n\n--- {r.url} ---\n{r.content[:4000]}"
+        elif r.success and _is_error_page(r):
+            logger.info("[Step 0.7] Skipping error page: %s", r.url)
+
+    if not combined_text.strip() or not settings.openai_api_key:
+        return [], page_cache
+
+    dept_hint = department or "engineering"
+    prompt = (
+        f"Extract people's names and titles from this company website content.\n"
+        f"Return a JSON array: [{{\"name\": \"...\", \"title\": \"...\"}}]\n"
+        f"Only include people whose titles are relevant to {dept_hint} (engineers, managers, tech leads, recruiters).\n"
+        f"Exclude founders, CEOs, CFOs, CMOs, and other pure executive/C-suite roles.\n"
+        f"If no relevant people are listed, return [].\n\n"
+        f"Content:\n{combined_text[:6000]}"
+    )
+
+    try:
+        client = AsyncOpenAI(api_key=settings.openai_api_key)
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        raw = response.choices[0].message.content or "{}"
+        data = json.loads(raw)
+        # Accept both {"people": [...]} and [...] top-level arrays
+        if isinstance(data, list):
+            candidates = data
+        else:
+            candidates = data.get("people", data.get("candidates", data.get("results", [])))
+        if not isinstance(candidates, list):
+            candidates = []
+        # Validate each entry has name + title
+        valid = [
+            c for c in candidates
+            if isinstance(c, dict) and c.get("name") and c.get("title")
+        ]
+        logger.info("[Step 0.7] Extracted %d team page candidates for %s", len(valid), company)
+        return valid, page_cache
+    except Exception as e:
+        logger.warning("[Step 0.7] Team page extraction failed: %s", e)
+        return [], page_cache
+
+
 async def research_company(
     company: str,
     role: str,
     scraper: ScraperTool | None = None,
+    page_cache: dict[str, str] | None = None,
 ) -> CompanyContext:
     """Gather company context for email personalization.
 
@@ -67,6 +152,7 @@ async def research_company(
     """
     scraper = scraper or ScraperTool()
     domain = _guess_domain(company)
+    page_cache = page_cache or {}
 
     urls = [
         f"https://{domain}/about",
@@ -74,11 +160,22 @@ async def research_company(
         f"https://{domain}/careers",
     ]
 
-    logger.info("Researching %s — scraping %d URLs...", company, len(urls))
-    results = await scraper.scrape_multiple(urls)
+    # Separate into already-cached and URLs we need to fetch
+    urls_to_fetch = [u for u in urls if u not in page_cache]
+    logger.info("Researching %s — scraping %d URLs (%d cached)...", company, len(urls_to_fetch), len(urls) - len(urls_to_fetch))
+
+    if urls_to_fetch:
+        results = await scraper.scrape_multiple(urls_to_fetch)
+    else:
+        results = []
 
     # Collect whatever we got (skip error/404 pages)
     scraped_text = ""
+    # First add cached content
+    for url in urls:
+        if url in page_cache and page_cache[url]:
+            scraped_text += f"\n\n--- {url} ---\n{page_cache[url][:3000]}"
+    # Then add newly fetched content
     for r in results:
         if r.success and r.content and not _is_error_page(r):
             # Truncate each page to keep total context manageable

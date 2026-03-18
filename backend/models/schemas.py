@@ -29,6 +29,7 @@ class Person(BaseModel):
     warm_signals: list[str] = []
     discovery_source: str = ""
     angle_confidence: str = ""  # "verified" | "suggested"
+    has_public_github: bool = False
 
 
 class EmailConfidence(str, Enum):
@@ -52,6 +53,9 @@ class EmailDraft(BaseModel):
     body: str
     tone: str = "warm-professional"
     personalization_notes: str = ""
+    sent_at: Optional[str] = None       # ISO datetime string when marked sent
+    replied: Optional[bool] = None      # True/False/None
+    outcome: Optional[str] = None       # "no_response" | "replied" | "referral" | "interview"
 
 
 class SearchStatus(str, Enum):

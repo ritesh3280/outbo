@@ -113,13 +113,21 @@ Job posting:
                            "designer", "analyst", "coordinator", "specialist", "architect",
                            "intern", "associate", "senior", "junior", "staff", "principal",
                            "full", "stack", "frontend", "backend", "front-end", "back-end",
-                           "head", "vp", "chief", "officer"}
+                           "head", "vp", "chief", "officer", "scientist", "researcher",
+                           "product", "software", "hardware", "platform", "data", "ml",
+                           "ai", "devops", "sre", "security", "mobile", "web", "cloud"}
             hm_words = [w.lower().rstrip(".,") for w in hm.split()]
-            # If every word is a role word, it's definitely a title not a name
-            # If most words (>50%) are role words, likely a title
+            # Must have at least 2 words (first + last name)
+            too_short = len(hm_words) < 2
+            # If most words (>50%) are role words, it's a title not a name
             role_word_count = sum(1 for w in hm_words if w in _ROLE_WORDS)
-            if role_word_count > 0 and role_word_count >= len(hm_words) * 0.5:
-                logger.info("Clearing hiring_manager '%s' — looks like a title, not a name", hm)
+            is_title = role_word_count > 0 and role_word_count >= len(hm_words) * 0.5
+            if too_short or is_title:
+                logger.info("Clearing hiring_manager '%s' — looks like a title, not a name (too_short=%s, is_title=%s)", hm, too_short, is_title)
+                # Salvage: move to reporting_to if it's not already set and looks like a role phrase
+                if is_title and not out["reporting_to"]:
+                    out["reporting_to"] = hm
+                    logger.info("Moved hiring_manager value to reporting_to: '%s'", hm)
                 out["hiring_manager"] = ""
 
         logger.info("Job context extracted: team=%s, department=%s, hiring_manager=%s, email_domain=%s", out["team"], out["department"], out["hiring_manager"], out["email_domain"])
@@ -139,6 +147,34 @@ def _extract_email_domain_from_text(content: str) -> str:
         if m.lower() not in _SKIP_EMAIL_DOMAINS:
             return m.lower()
     return ""
+
+
+def _extract_city(location: str) -> str | None:
+    """Extract a specific city name from a location string, or None if remote/hybrid/unspecific.
+
+    Handles formats like:
+    - "New York" → "New York"
+    - "San Francisco, CA" → "San Francisco"
+    - "Austin, TX (Hybrid)" → "Austin"
+    - "GameChanger HQ - New York" → "New York"
+    - "Remote" / "Hybrid" / "" → None
+    """
+    _SKIP = {"remote", "anywhere", "hybrid", "flexible", "worldwide", "global", "us", "usa"}
+    if not location:
+        return None
+    # Handle "HQ - City" or "Office - City" pattern — take last segment
+    if " - " in location:
+        location = location.split(" - ")[-1]
+    # Strip parentheticals like "(Hybrid)" or "(Remote)"
+    location = re.sub(r'\s*\(.*?\)', '', location).strip()
+    # Strip state abbreviation like ", CA" or ", TX"
+    location = re.sub(r',\s*[A-Z]{2}$', '', location).strip()
+    if not location or location.lower() in _SKIP:
+        return None
+    # If remaining text contains a skip word, bail
+    if any(skip in location.lower().split() for skip in _SKIP):
+        return None
+    return location
 
 
 def _empty_job_context() -> JobContext:
@@ -332,6 +368,15 @@ def build_search_queries(
             priority=2,
         ))
 
+    # 2e: Location-filtered (alongside, not replacing, existing queries)
+    city = _extract_city(jc.get("location", "") or "")
+    if city and keywords:
+        queries.append(QueryGroup(
+            query=f'site:linkedin.com/in "at {company}" "{keywords[0]}" "{city}"',
+            category="team_search",
+            priority=2,
+        ))
+
     # ── TIER 3: Warm path (only if user profile available) ────────────
     if user_profile:
         for uni in (user_profile.universities or [])[:2]:
@@ -355,6 +400,21 @@ def build_search_queries(
         priority=4,
     ))
 
+    # ── TIER 2b: Intern-specific recruiter queries (promoted for intern roles) ──
+    seniority = jc.get("seniority", "") or ""
+    is_intern = seniority.lower() == "intern"
+    if is_intern:
+        queries.append(QueryGroup(
+            query=f'site:linkedin.com/in "{company}" "university recruiter" OR "campus recruiter"',
+            category="recruiter",
+            priority=2,
+        ))
+        queries.append(QueryGroup(
+            query=f'site:linkedin.com/in "{company}" "technical recruiter" "intern" OR "internship"',
+            category="recruiter",
+            priority=2,
+        ))
+
     # ── TIER 5: Standard fallback (always included) ───────────────────
     queries.append(QueryGroup(
         query=f'site:linkedin.com/in "at {company}" "university recruiter" OR "campus recruiter" OR "early career recruiter"',
@@ -377,9 +437,10 @@ def build_search_queries(
         priority=5,
     ))
 
-    # ── Budget cap: sort by priority, keep top 10 ─────────────────────
+    # ── Budget cap: sort by priority, keep top N (12 for intern, 10 otherwise) ──
+    cap = 12 if is_intern else 10
     queries.sort(key=lambda q: q.priority)
-    queries = queries[:10]
+    queries = queries[:cap]
 
     logger.info(
         "Built %d search queries (tiers: %s)",

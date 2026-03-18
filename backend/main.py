@@ -350,6 +350,37 @@ async def edit_email(payload: dict):
     raise HTTPException(status_code=404, detail="Contact not found in drafts")
 
 
+# ── Email outcome tracking ───────────────────────────────────────────────
+
+@app.post("/api/email/outcome")
+async def update_email_outcome(payload: dict):
+    """Track whether a draft was sent and/or received a reply.
+
+    Matches by name + email to handle duplicate names within the same campaign.
+    """
+    job_id = payload.get("job_id", "")
+    contact_name = payload.get("name", "")
+    contact_email = payload.get("email", "")
+
+    result = await _get_job(job_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+
+    for draft in result.email_drafts:
+        if draft.name == contact_name and draft.email == contact_email:
+            if "sent_at" in payload and payload["sent_at"] is not None:
+                draft.sent_at = payload["sent_at"]
+            if "replied" in payload and payload["replied"] is not None:
+                draft.replied = payload["replied"]
+            if "outcome" in payload and payload["outcome"] is not None:
+                draft.outcome = payload["outcome"]
+            await _save_job(result)
+            await _broadcast_to_websockets(job_id, result)
+            return {"status": "updated"}
+
+    raise HTTPException(status_code=404, detail="Draft not found for this contact")
+
+
 # ── History ───────────────────────────────────────────────────────────────
 
 @app.get("/api/history")
@@ -367,6 +398,8 @@ async def get_history():
             "status": r.status.value,
             "people_count": len(r.people),
             "drafts_count": len(r.email_drafts),
+            "sent_count": sum(1 for d in r.email_drafts if d.sent_at),
+            "replied_count": sum(1 for d in r.email_drafts if d.replied is True),
         }
         for r in results
     ]

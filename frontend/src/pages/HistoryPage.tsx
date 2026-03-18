@@ -90,6 +90,16 @@ export default function HistoryPage({ onOpenJob }: Props) {
                 </div>
                 <div className="text-xs text-gray-500 mt-0.5">
                   {entry.people_count} contacts · {entry.drafts_count} drafts
+                  {entry.sent_count > 0 && (
+                    <span className="ml-2 text-gray-400">
+                      · {entry.sent_count} sent
+                      {entry.replied_count > 0 && (
+                        <span className="text-green-600 ml-1">
+                          · {entry.replied_count} repl{entry.replied_count === 1 ? 'y' : 'ies'} ({Math.round(entry.replied_count / entry.sent_count * 100)}%)
+                        </span>
+                      )}
+                    </span>
+                  )}
                 </div>
               </div>
               <span

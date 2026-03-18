@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react';
 import type { Person, EmailResult, EmailDraft } from '../services/api';
-import { editEmail, generateEmail } from '../services/api';
+import { editEmail, generateEmail, markOutcome } from '../services/api';
 
 interface Props {
   person: Person;
@@ -43,6 +43,9 @@ export default function ContactCard({
   const [saving, setSaving] = useState(false);
   const [generating, setGenerating] = useState(false);
   const [copied, setCopied] = useState(false);
+  const [showSentPrompt, setShowSentPrompt] = useState(false);
+  const [sentAt, setSentAt] = useState<string | null>(draft?.sent_at ?? null);
+  const [replied, setReplied] = useState<boolean | null>(draft?.replied ?? null);
 
   const confidence = emailResult?.confidence || 'low';
 
@@ -84,14 +87,42 @@ export default function ContactCard({
     navigator.clipboard.writeText(text);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
+    // Show "Did you send this?" prompt after copying (only if not already sent)
+    if (!sentAt) {
+      setShowSentPrompt(true);
+    }
+  }
+
+  async function handleMarkSent() {
+    if (!emailResult?.email) return;
+    const now = new Date().toISOString();
+    try {
+      await markOutcome({ job_id: jobId, name: person.name, email: emailResult.email, sent_at: now });
+      setSentAt(now);
+    } catch {
+      // ignore
+    }
+    setShowSentPrompt(false);
+  }
+
+  async function handleMarkReplied(didReply: boolean) {
+    if (!emailResult?.email) return;
+    try {
+      await markOutcome({ job_id: jobId, name: person.name, email: emailResult.email, replied: didReply });
+      setReplied(didReply);
+    } catch {
+      // ignore
+    }
   }
 
   useEffect(() => {
     if (draft) {
       setEditSubject(draft.subject);
       setEditBody(draft.body);
+      if (draft.sent_at !== undefined) setSentAt(draft.sent_at ?? null);
+      if (draft.replied !== undefined) setReplied(draft.replied ?? null);
     }
-  }, [draft?.subject, draft?.body]);
+  }, [draft?.subject, draft?.body, draft?.sent_at, draft?.replied]);
 
   return (
     <div className="rounded-lg border border-gray-200 bg-white overflow-hidden">
@@ -101,7 +132,7 @@ export default function ContactCard({
         className="w-full px-4 py-3 flex items-center justify-between hover:bg-gray-50 transition-colors text-left cursor-pointer"
       >
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <h3 className="font-medium text-gray-900 truncate">{person.name}</h3>
             {person.contact_category && (
               <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-600 border border-gray-200">
@@ -111,6 +142,15 @@ export default function ContactCard({
             <span className="text-xs text-gray-400" title={`Influence: ${(person.influence_score * 100).toFixed(0)} · Reachability: ${(person.reachability_score * 100).toFixed(0)}`}>
               {(person.priority_score * 100).toFixed(0)}
             </span>
+            {sentAt && replied === null && (
+              <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 border border-gray-200">Sent</span>
+            )}
+            {replied === true && (
+              <span className="text-xs px-1.5 py-0.5 rounded bg-green-50 text-green-700 border border-green-200">Replied</span>
+            )}
+            {replied === false && (
+              <span className="text-xs px-1.5 py-0.5 rounded bg-gray-100 text-gray-500 border border-gray-200">No response</span>
+            )}
           </div>
           <p className="text-sm text-gray-500 truncate">{person.title}</p>
           {person.outreach_angle && (
@@ -157,6 +197,11 @@ export default function ContactCard({
             >
               {generating ? 'Generating…' : 'Generate email'}
             </button>
+          )}
+          {person.has_public_github === true && (
+            <span className="text-xs px-1.5 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200">
+              GitHub
+            </span>
           )}
           {person.linkedin_url && (
             <a
@@ -221,6 +266,48 @@ export default function ContactCard({
               {copied ? 'Copied!' : 'Copy'}
             </button>
           </div>
+
+          {/* "Did you send this?" prompt — shown after copying */}
+          {showSentPrompt && !sentAt && (
+            <div className="flex items-center gap-2 pt-1">
+              <span className="text-xs text-gray-500">Did you send this?</span>
+              <button
+                type="button"
+                onClick={handleMarkSent}
+                className="text-xs px-2 py-1 rounded bg-gray-900 text-white hover:bg-gray-800 transition-colors cursor-pointer"
+              >
+                Yes
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowSentPrompt(false)}
+                className="text-xs px-2 py-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer"
+              >
+                Not yet
+              </button>
+            </div>
+          )}
+
+          {/* "Mark replied" controls — shown any time after sent */}
+          {sentAt && replied === null && (
+            <div className="flex items-center gap-2 pt-1">
+              <span className="text-xs text-gray-500">Got a reply?</span>
+              <button
+                type="button"
+                onClick={() => handleMarkReplied(true)}
+                className="text-xs px-2 py-1 rounded bg-green-600 text-white hover:bg-green-700 transition-colors cursor-pointer"
+              >
+                Yes, replied
+              </button>
+              <button
+                type="button"
+                onClick={() => handleMarkReplied(false)}
+                className="text-xs px-2 py-1 rounded border border-gray-200 text-gray-600 hover:bg-gray-50 transition-colors cursor-pointer"
+              >
+                No response
+              </button>
+            </div>
+          )}
         </div>
       )}
 
