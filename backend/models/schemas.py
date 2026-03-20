@@ -11,6 +11,7 @@ class SearchRequest(BaseModel):
     linkedin_url: Optional[str] = None
     company_website: Optional[str] = None
     job_url: Optional[str] = None
+    portfolio_url: Optional[str] = None
 
 
 class Person(BaseModel):
@@ -30,6 +31,8 @@ class Person(BaseModel):
     discovery_source: str = ""
     angle_confidence: str = ""  # "verified" | "suggested"
     has_public_github: bool = False
+    apollo_id: str = ""            # Apollo.io person ID for enrichment
+    has_apollo_email: bool = False  # Apollo confirmed email exists for this person
 
 
 class EmailConfidence(str, Enum):
@@ -91,6 +94,20 @@ class SearchResult(BaseModel):
     user_profile_data: Optional[dict] = None
 
 
+class Project(BaseModel):
+    name: str
+    description: str = ""
+    location: str = ""  # e.g. "HackMIT 2024", "MIT CSAIL", "Personal project"
+
+
+class WorkExperience(BaseModel):
+    company: str
+    title: str
+    description: str = ""
+    start_date: str = ""  # e.g. "2022" or "Jun 2022"
+    end_date: str = ""    # empty = present/current
+
+
 class UserProfileDoc(BaseModel):
     """Persistent user profile — saved once, reused across all campaigns."""
     profile_id: str = "default"
@@ -102,5 +119,10 @@ class UserProfileDoc(BaseModel):
     skills: list[str] = []
     linkedin_headline: str = ""
     linkedin_summary: str = ""
+    portfolio_url: str = ""
+    bio: str = ""  # Rich summary scraped from portfolio/resume — used in email generation
+    active_resume_id: str = ""  # ID of the resume to use in email generation
+    projects: list[Project] = []
+    work_experience: list[WorkExperience] = []
     created_at: str = ""
     updated_at: str = ""

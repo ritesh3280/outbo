@@ -51,18 +51,30 @@ def _is_error_page(result) -> bool:
 _MIN_NAME_PATTERNS = 5  # Minimum person-name patterns before calling OpenAI
 
 
+_JOB_ROLE_RE = re.compile(
+    r'\b(?:Engineer|Developer|Designer|Analyst|Manager|Recruiter|Scientist|Architect|Intern)\b'
+)
+
+
+def _count_job_listings(page_text: str) -> int:
+    """Count unique lines containing role keywords as a proxy for open job count."""
+    job_lines = {line.strip() for line in page_text.split('\n') if _JOB_ROLE_RE.search(line)}
+    return len(job_lines)
+
+
 async def scrape_team_pages(
     company: str,
     base_url: str,
     department: str,
     scraper: ScraperTool | None = None,
-) -> tuple[list[dict], dict[str, str]]:
-    """Scrape company /about and /team pages to extract names + titles.
+) -> tuple[list[dict], dict[str, str], int | None]:
+    """Scrape company /about, /team, and /careers pages to extract names + titles.
 
     Returns:
-        (candidates, page_cache)
+        (candidates, page_cache, careers_job_count)
         candidates: [{"name": "...", "title": "..."}] filtered to department-relevant roles
         page_cache: {url: content} for reuse in research_company() to avoid double-scraping
+        careers_job_count: rough count of open jobs (None if careers page not found)
     """
     scraper = scraper or ScraperTool()
     # Normalize base_url
@@ -70,27 +82,66 @@ async def scrape_team_pages(
         base_url = f"https://{base_url}"
     base_url = base_url.rstrip("/")
 
-    urls = [f"{base_url}/about", f"{base_url}/team"]
-    logger.info("[Step 0.7] Scraping team pages for %s: %s", company, urls)
+    # Extract bare domain for subdomain variant (e.g. "stripe.com" from "https://stripe.com")
+    import urllib.parse as _urlparse
+    _parsed = _urlparse.urlparse(base_url)
+    _bare_domain = _parsed.netloc or _parsed.path  # fallback: base_url itself
 
-    results = await scraper.scrape_multiple(urls)
+    # Expanded team page patterns — scrape first 5 that succeed
+    # Cap at 5 to keep Firecrawl usage reasonable; results are merged
+    team_url_candidates = [
+        f"{base_url}/about",
+        f"{base_url}/team",
+        f"{base_url}/our-team",
+        f"{base_url}/people",
+        f"{base_url}/leadership",
+        f"{base_url}/about/team",
+        f"{base_url}/company/team",
+        f"{base_url}/about-us",
+        f"https://team.{_bare_domain}",  # subdomain variant
+    ]
+    # Deduplicate while preserving order
+    seen_t: set[str] = set()
+    team_urls: list[str] = []
+    for _u in team_url_candidates:
+        if _u not in seen_t:
+            seen_t.add(_u)
+            team_urls.append(_u)
+
+    careers_urls = [f"{base_url}/careers", f"{base_url}/jobs"]
+    logger.info("[Step 0.7] Scraping team pages for %s (%d candidates)", company, len(team_urls))
+
+    all_results = await scraper.scrape_multiple(team_urls + careers_urls)
     page_cache: dict[str, str] = {}
     combined_text = ""
+    careers_job_count: int | None = None
 
-    for r in results:
-        if r.success and r.content and not _is_error_page(r):
-            page_cache[r.url] = r.content
-            # Quick heuristic: count capitalized two-word sequences (likely person names)
-            name_patterns = re.findall(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', r.content)
-            if len(name_patterns) < _MIN_NAME_PATTERNS:
-                logger.info("[Step 0.7] Skipping %s — only %d name patterns found", r.url, len(name_patterns))
-                continue
-            combined_text += f"\n\n--- {r.url} ---\n{r.content[:4000]}"
-        elif r.success and _is_error_page(r):
+    for r in all_results:
+        if not r.success or not r.content:
+            continue
+        if _is_error_page(r):
             logger.info("[Step 0.7] Skipping error page: %s", r.url)
+            continue
+
+        # Careers/jobs pages — count job listings, add to cache, don't extract names
+        if r.url in careers_urls:
+            careers_job_count = _count_job_listings(r.content)
+            page_cache[r.url] = r.content  # reuse in Step 3 to avoid double-scraping
+            logger.info(
+                "[Step 0.7] Careers page %s — ~%d job listing lines", r.url, careers_job_count
+            )
+            continue
+
+        # Team/about pages — add to cache and check for person-name patterns
+        page_cache[r.url] = r.content
+        name_patterns = re.findall(r'\b[A-Z][a-z]+ [A-Z][a-z]+\b', r.content)
+        if len(name_patterns) < _MIN_NAME_PATTERNS:
+            logger.info("[Step 0.7] Skipping %s — only %d name patterns found", r.url, len(name_patterns))
+            continue
+        combined_text += f"\n\n--- {r.url} ---\n{r.content[:4000]}"
 
     if not combined_text.strip() or not settings.openai_api_key:
-        return [], page_cache
+        return [], page_cache, careers_job_count
 
     dept_hint = department or "engineering"
     prompt = (
@@ -125,10 +176,10 @@ async def scrape_team_pages(
             if isinstance(c, dict) and c.get("name") and c.get("title")
         ]
         logger.info("[Step 0.7] Extracted %d team page candidates for %s", len(valid), company)
-        return valid, page_cache
+        return valid, page_cache, careers_job_count
     except Exception as e:
         logger.warning("[Step 0.7] Team page extraction failed: %s", e)
-        return [], page_cache
+        return [], page_cache, careers_job_count
 
 
 async def research_company(
@@ -258,20 +309,21 @@ def _guess_domain(company: str) -> str:
 SINGLE_EMAIL_SYSTEM_PROMPT = """You write cold outreach emails from a student applying for jobs/internships.
 
 Rules:
-- 4-6 sentences max. Short and genuine.
-- Open with something specific to THE RECIPIENT (not the company generically).
-- Briefly mention 1-2 relevant things about the sender (if provided).
-- End with a clear, low-friction ask (15-min chat, referral, or advice).
-- Sound like a real human, not a template.
-- Warm but professional tone.
+- 5-7 sentences. No more, no less.
+- Sign off with the sender's actual name from "Sender name:" in the prompt. Never invent or assume a name.
+- First sentence: ONE specific thing about the RECIPIENT — their role, a project their team ships, or something from their LinkedIn. Not "I came across your profile."
+- Middle: 1-2 sentences about the sender — school, relevant skills, and ONE concrete thing they've built or done. Be specific, not generic.
+- Closing: a clear, low-friction ask. Either a 15-min chat, advice on the role, or (for engineers) subtly mention a referral if they think you'd be a fit.
+- No hollow phrases: "I was impressed by", "I hope this finds you well", "I'd love to learn more about your journey", "I came across your profile".
+- Write like a real person, not a cover letter. Conversational but professional.
 
-Tone adjustments:
-- Recruiter → be more direct, mention the specific role you're applying for.
-- Engineer → lead with technical interest, mention shared interests or their work.
-- Manager → show you understand what their team does.
+Tone by recipient type:
+- Recruiter: name the exact role title, keep it direct.
+- Engineer: lead with shared tech or something specific about what they build. Casual referral mention is fine.
+- Manager: show you understand what their team is responsible for.
 
-Return JSON:
-{"subject": "...", "body": "...", "personalization_notes": "what you referenced to personalize this email"}"""
+Return JSON only:
+{"subject": "...", "body": "...", "personalization_notes": "what specific detail you used to personalize"}"""
 
 
 async def generate_single_email(
@@ -334,14 +386,15 @@ async def generate_single_email(
             f"- Team: {team}\n"
             f"- Key tech: {tech}\n"
             f"- What the role involves: {reqs}\n"
-            "For engineers, mention shared tech stack interest. For recruiters, reference the exact posting. "
+            "For engineers, mention shared tech stack interest; you may mention the referral possibility as a reason to connect — but keep it casual, not transactional. "
+            "For recruiters, reference the exact posting. "
             "For managers, show you understand what their team builds.\n\n"
         )
 
     user_prompt = (
         f"Write a cold outreach email.\n\n"
-        f"Sender: A student applying for {role} at {company_context.company}\n"
-        f"Sender's background: {user_info or 'Not provided'}\n\n"
+        f"Sender is a student applying for {role} at {company_context.company}.\n"
+        f"Sender info (use 'Sender name' as the sign-off name — do not invent a different name):\n{user_info or 'Not provided'}\n\n"
         f"Recipient: {person.name}, {person.title}\n"
         f"Recipient type: {recipient_type}\n"
         f"Their LinkedIn snippet: {person.profile_summary[:300] if person.profile_summary else 'Not available'}\n\n"

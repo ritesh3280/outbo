@@ -159,16 +159,42 @@ export interface HistoryEntry {
   replied_count: number;
 }
 
+export interface Project {
+  name: string;
+  description: string;
+  location: string;
+}
+
+export interface WorkExperience {
+  company: string;
+  title: string;
+  description: string;
+  start_date: string;
+  end_date: string;
+}
+
+export interface ResumeDoc {
+  resume_id: string;
+  filename: string;
+  size: number;
+  uploaded_at: string;
+}
+
 export interface UserProfileDoc {
   profile_id: string;
   name: string;
   linkedin_url: string;
   resume_url: string;
+  portfolio_url: string;
   universities: string[];
   previous_companies: string[];
   skills: string[];
   linkedin_headline: string;
   linkedin_summary: string;
+  bio: string;
+  active_resume_id: string;
+  projects: Project[];
+  work_experience: WorkExperience[];
   created_at: string;
   updated_at: string;
 }
@@ -199,4 +225,35 @@ export async function deleteProfile(): Promise<void> {
     method: 'DELETE',
   });
   if (!response.ok) throw new Error(`Delete profile failed: ${response.status}`);
+}
+
+export async function uploadResume(file: File): Promise<ResumeDoc> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const response = await fetch(`${API_BASE}/api/profile/resumes`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(err.detail || `Resume upload failed: ${response.status}`);
+  }
+  return response.json();
+}
+
+export async function listResumes(): Promise<ResumeDoc[]> {
+  const response = await fetch(`${API_BASE}/api/profile/resumes`);
+  if (!response.ok) return [];
+  return response.json();
+}
+
+export async function deleteResume(resumeId: string): Promise<void> {
+  const response = await fetch(`${API_BASE}/api/profile/resumes/${resumeId}`, {
+    method: 'DELETE',
+  });
+  if (!response.ok) throw new Error(`Delete resume failed: ${response.status}`);
+}
+
+export function getResumeDownloadUrl(resumeId: string): string {
+  return `${API_BASE}/api/profile/resumes/${resumeId}`;
 }

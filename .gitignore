@@ -1,6 +1,9 @@
 # Environment
 .env
 
+# Search logs (auto-generated, not for version control)
+logs/
+
 # Python
 __pycache__/
 *.py[cod]

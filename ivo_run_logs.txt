@@ -1,0 +1,184 @@
+Ivo — Software Engineering Intern
+Pipeline run: 2026-03-17 ~21:24 local time
+Job ID: d1a0136e-8015-44fd-9ac0-181425e6831a
+Job URL: https://jobs.lever.co/ivo/83b626de-53c8-4505-b0ea-253fdcb83680
+Company website: https://www.ivo.ai/
+LinkedIn: https://www.linkedin.com/in/rthipparthi/
+Resume: https://drive.google.com/file/d/1pnNzX4iWyEVHwmZ_XvtzX_NIu5Y4MVSk/view
+
+============================================================
+PIPELINE START: Ivo — Software Engineering Intern
+Job ID: d1a0136e-8015-44fd-9ac0-181425e6831a
+============================================================
+
+[Step 0] Analyzing job posting: https://jobs.lever.co/ivo/83b626de-53c8-4505-b0ea-253fdcb83680
+  Scraped https://jobs.lever.co/ivo/83b626de-53c8-4505-b0ea-253fdcb83680 — title: Ivo - Software Engineering Intern, length: 2959
+  Job context extracted: team=, department=engineering, hiring_manager=, email_domain=
+[Step 0] Done in 6.8s
+  Team: (not found)
+  Department: engineering
+  Seniority: intern
+  Hiring manager: (not found)
+  Email domain: (not found)
+  Reporting to: (not found)
+  Tech stack: React, Redux Toolkit, Next.js, Node.js, OpenAI, Pytorch, Firebase, Azure
+  Hiring signals: (none)
+  Keywords: Software Engineer, Intern, AI, Generative AI
+
+[Step 0.5] Loading user profile...
+[Step 0.5] Using saved profile: Ritesh Thipparthi
+  Universities: ['University of Maryland College Park']
+  Previous companies: (none)
+  Skills: (none)
+
+[Step 0.7] Scraping team pages at https://www.ivo.ai/
+  Scraping team pages for Ivo: ['https://www.ivo.ai/about', 'https://www.ivo.ai/team']
+  Scraped https://www.ivo.ai/about — title: Not Found, length: 818
+  Scraped https://www.ivo.ai/team — title: Not Found, length: 818
+  Skipping error page: https://www.ivo.ai/about
+  Skipping error page: https://www.ivo.ai/team
+[Step 0.7] Done in 1.3s — 0 seed candidates
+
+[Step 1] Finding people at Ivo...
+Built 12 search queries (tiers: 1, 2, 3, 4, 5)
+Running 12 Serper queries for Ivo...
+  Query 1  [tier 1, job_posting_sharer]: "https://jobs.lever.co/ivo/83b626de-53c8-4505-b0ea-253fdcb83680" site:linkedin.com
+  Query 2  [tier 1, job_posting_sharer]: site:linkedin.com/in "Ivo" "Software Engineering Intern" "hiring" OR "join my team" OR "we're hiring"
+  Query 3  [tier 2, team_search]:        site:linkedin.com/in "at Ivo" "Software Engineer"
+  Query 4  [tier 2, team_search]:        site:linkedin.com/in "at Ivo" "Intern"
+  Query 5  [tier 2, team_search]:        site:linkedin.com/in "at Ivo" "React" OR "Redux Toolkit" OR "Next.js"
+  Query 6  [tier 2, team_search]:        site:linkedin.com/in "at Ivo" "engineering" engineer OR developer
+  Query 7  [tier 2, team_search]:        site:linkedin.com/in "at Ivo" "Software Engineer" "San Francisco, California"
+  Query 8  [tier 2, recruiter]:          site:linkedin.com/in "Ivo" "university recruiter" OR "campus recruiter"   ← BUG: missing "at" prefix
+  Query 9  [tier 2, recruiter]:          site:linkedin.com/in "Ivo" "technical recruiter" "intern" OR "internship" ← BUG: missing "at" prefix
+  Query 10 [tier 3, warm_path]:          site:linkedin.com/in "at Ivo" "University of Maryland College Park"
+  Query 11 [tier 4, general]:            site:linkedin.com/in "at Ivo" Software Engineer engineer OR developer
+  Query 12 [tier 5, recruiter]:          site:linkedin.com/in "at Ivo" "university recruiter" OR "campus recruiter" OR "early career recruiter"
+
+  [job_posting_sharer] → 0 LinkedIn profiles
+  [job_posting_sharer] → 7 LinkedIn profiles
+  [team_search]        → 10 LinkedIn profiles
+  [team_search]        → 10 LinkedIn profiles
+  [team_search]        → 10 LinkedIn profiles
+  [team_search]        → 10 LinkedIn profiles
+  [team_search]        → 4 LinkedIn profiles
+  [recruiter]          → 10 LinkedIn profiles  ← mostly Wells Fargo/JPMorgan/Merrill Lynch recruiters
+  [recruiter]          → 4 LinkedIn profiles
+  [warm_path]          → 0 LinkedIn profiles
+  [general]            → 10 LinkedIn profiles
+  [recruiter]          → 2 LinkedIn profiles
+
+Serper: 77 raw → 53 unique after dedup
+After hard filter: 48 candidates
+Validating 48 profiles...  ← all 48 sent to LLM; 28 are obvious false positives
+
+VALIDATION FAILURES (28/48 false positives):
+  Ivo Moreno          (title: San Diego, California, United States)      ← person named "Ivo"
+  Samuel Ivo          (title: Rasa)                                       ← person named "Ivo"
+  Yang W.             (title: Engineering)
+  Ze Yuan (Gavin) Zhang (title: San Francisco, California, United States)
+  Basil Wang          (title: Sunnyvale, California, United States)
+  Pedro Ivo Amaral Lima (title: )                                         ← person named "Ivo"
+  Katie Luong         (title: DoorDash)
+  Adane Negate        (title: Software engineer at GM - LinkedIn)
+  Jane Johnstone      (title: Campus Recruiter at Wells Fargo)            ← from query 8 (bad format)
+  Aya Kato            (title: Columbus, Ohio, United States)
+  Luisa Alona         (title: Campus Recruiter at JPMorgan Chase & Co.)   ← from query 8/9
+  maddie collins      (title: Hiring @ Confido (YC S21))
+  Ricardo Omar Molina Nunez (title: Software Engineer at Visionary ...)
+  Arnav Singh         (title: )
+  Matthew Sumner      (title: )
+  Alexander Picel     (title: Staff Software Engineer at Warner Bros. Discovery)
+  Mike Feldberg       (title: Software Engineer)
+  Chak Ayyagari       (title: PhD, Infrastructure Solutions - LinkedIn)
+  Kadi Volhonski      (title: Recruiter for life. Join the Starship fleet!)
+  Ulices Rubinsztejn Veron (title: Lead Software Engineer at ... - LinkedIn)
+  Matthew Goldsmith   (title: AI & Intelligent Automation Specialist - LinkedIn)
+  Dianah May          (title: Campus Recruiter at Wells Fargo)            ← from query 8/9
+  Jayne Johnstone     (title: Campus Recruiter at Merrill Lynch)          ← from query 8/9
+  Max Lu              (title: Ivo)
+  Eric Christensen, P.E. (title: IVO Systems - LinkedIn)
+  Adeline Su          (title: Computer Science and Business Double Degree ...)
+  Jefferson Lee       (title: Does computer stuff; studying law stuff - LinkedIn)
+  Rennie Huang        (title: Software Developer)
+
+After validation: 20 confirmed employees
+
+Checking GitHub presence for 20 engineer/manager candidates...
+Scoring 20 people (dual-axis: influence + reachability)...
+
+SCORING RESULT (top → bottom):
+  Long Duong   — Software Engineer at IVO           (0.78, inf=0.90, reach=0.70)
+  Andre Wang   — Enterprise Account Executive at Ivo AI  (0.68, inf=0.65, reach=0.70)  ← misclassified as "recruiter"; is actually sales
+  [18 others with scores 0.18–0.34]
+
+Quality threshold: 2/20 passed (threshold=0.60)
+  Dropped: Nicole Blumhorst   (score=0.34, no warm signals)
+  Dropped: Cody Hawkins        (score=0.34, no warm signals)
+  Dropped: Bill Li             (score=0.34, no warm signals)
+  Dropped: Kostja Mirkovic     (score=0.34, no warm signals)
+  Dropped: Bingrui Wang        (score=0.34, no warm signals)
+  Dropped: Ivo Andreev         (score=0.34, no warm signals)  ← another person named "Ivo", validated as Ivo employee
+  Dropped: Diana Campbell      (score=0.34, no warm signals)
+  Dropped: Mark Pang           (score=0.34, no warm signals)
+  Dropped: Collin Schaible     (score=0.34, no warm signals)
+  Dropped: Solène FRANCO       (score=0.18, no warm signals)
+  Dropped: Johansen Mwijage    (score=0.18, no warm signals)
+  Dropped: Pedro Ivo           (score=0.18, no warm signals)  ← yet another "Ivo" first name, slipped through
+  Dropped: Sebastian Schweigert (score=0.18, no warm signals)
+  Dropped: Jacob Duligall      (score=0.18, no warm signals)
+  Dropped: Arie Jongejan       (score=0.18, no warm signals)
+  Dropped: Charlie Clark       (score=0.18, no warm signals)
+  Dropped: Paul Lee            (score=0.18, no warm signals)
+  Dropped: Bill Jiang          (score=0.18, no warm signals)
+
+People finder complete: 2 final contacts for Ivo
+
+[Step 1] Done in 45.1s — 2 contacts selected:
+  1. Andre Wang — Enterprise Account Executive at Ivo AI
+     score=0.68 (influence=0.65, reach=0.70) | recruiter | src=recruiter
+     angle: Reach out to discuss internship opportunities... [verified]
+  2. Long Duong — Software Engineer at IVO
+     score=0.78 (influence=0.90, reach=0.70) | team_member | src=team_search
+     angle: Express your interest in the Software Engineering Intern role... [verified]
+
+[Step 2] Finding emails for 2 contacts...
+  Using user-supplied domain for Ivo: ivo.ai
+  Company domain: ivo.ai
+  Scraped https://github.com/orgs/ivo/people — title: Page not found · GitHub · GitHub, length: 960
+  Scraped https://github.com/ivo — title: ivo (Ivo Stock) · GitHub, length: 4972
+  No company emails found on GitHub for Ivo
+[Step 2] Done in 3.1s — 2/2 emails found:
+  Andre Wang → andre.wang@ivo.ai [LOW] (Pattern guess)
+  Long Duong → long.duong@ivo.ai [LOW] (Pattern guess)
+
+[Step 3] Researching Ivo...
+  Scraping 3 URLs (0 cached)...
+  Scraped https://ivo.ai/blog    — title: Blog | Ivo, length: 11136
+  Scraped https://ivo.ai/careers — title: Careers | Ivo, length: 3173
+  Scraped https://ivo.ai/about   — title: Not Found, length: 818
+  Skipping error page: https://ivo.ai/about (title: Not Found)
+[Step 3] Done in 5.2s
+  Mission: Ivo leverages generative AI to transform legal operations, particularly focusing on contract negotiation...
+  Recent news: Ivo raised $55M to enhance its AI contract intelligence platform...
+
+============================================================
+PIPELINE COMPLETE in 62.0s
+2 contacts, 2 emails found (drafts on demand)
+============================================================
+
+--- ANALYSIS NOTES ---
+Root causes identified:
+1. Recruiter queries 8 & 9 used "{company}" not "at {company}" — matched "Ivo" as a first name
+2. 28/48 false positives were sent to LLM validation unnecessarily (~$0.01 wasted per run)
+3. Only 2 contacts passed threshold — no MIN_FLOOR supplement triggered
+4. Andre Wang (Enterprise Account Executive) misclassified as "recruiter" — sales role with no hiring authority
+5. Campus recruiter queries (8, 9, 12) wasted 3 query slots for a ~30-person startup
+
+Fixes applied (see git history):
+1. Tier-2 intern recruiter queries now use "at {company}" prefix
+2. Pre-validation heuristic: name-match (short company ≤6 chars) + title company mismatch
+3. MIN_FLOOR=4 with SUPPLEMENT_MIN_SCORE=0.30 gate
+4. EXCLUDE_KEYWORDS extended: "account executive", "business development", "customer success"
+5. Step 0.7 now scrapes /careers, counts job lines, passes careers_job_count → skips campus recruiter
+   tier-2 queries when count < 10 (small company heuristic)

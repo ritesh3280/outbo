@@ -1,0 +1,169 @@
+[
+  {
+    "test_case_id": "stripe_intern",
+    "test_case_label": "Stripe SWE Intern",
+    "stage_label": "baseline",
+    "timestamp": "2026-03-18T04:23:54.642911+00:00",
+    "metrics": {
+      "total": 8,
+      "avg_score": 0.751,
+      "avg_influence": 0.65,
+      "avg_reachability": 0.819,
+      "max_score": 0.8,
+      "with_warm_signals": 3,
+      "with_github": 0,
+      "by_source": {
+        "recruiter": 5,
+        "general": 2,
+        "likely_manager": 1
+      },
+      "by_category": {
+        "recruiter": 7,
+        "general": 1
+      },
+      "score_bands": {
+        "0.0-0.5": 0,
+        "0.5-0.6": 0,
+        "0.6-0.7": 1,
+        "0.7-0.8": 5,
+        "0.8+": 2
+      },
+      "top3": [
+        {
+          "name": "Lindsay Brown",
+          "title": "Stripe - LinkedIn",
+          "score": 0.8,
+          "source": "recruiter",
+          "warm": 1
+        },
+        {
+          "name": "Bridget Lane",
+          "title": "Engineering Manager at Stripe",
+          "score": 0.68,
+          "source": "general",
+          "warm": 0
+        },
+        {
+          "name": "Amy Salazar",
+          "title": "Recruiting @ Stripe",
+          "score": 0.8,
+          "source": "general",
+          "warm": 1
+        }
+      ],
+      "duration_s": 194.8
+    }
+  },
+  {
+    "test_case_id": "stripe_intern",
+    "test_case_label": "Stripe SWE Intern",
+    "stage_label": "stage1_github_team_adaptive",
+    "timestamp": "2026-03-18T04:26:43.587173+00:00",
+    "metrics": {
+      "total": 8,
+      "avg_score": 0.763,
+      "avg_influence": 0.65,
+      "avg_reachability": 0.837,
+      "max_score": 0.8,
+      "with_warm_signals": 3,
+      "with_github": 1,
+      "by_source": {
+        "likely_manager": 2,
+        "recruiter": 5,
+        "general": 1
+      },
+      "by_category": {
+        "general": 2,
+        "recruiter": 6
+      },
+      "score_bands": {
+        "0.0-0.5": 0,
+        "0.5-0.6": 0,
+        "0.6-0.7": 0,
+        "0.7-0.8": 5,
+        "0.8+": 3
+      },
+      "top3": [
+        {
+          "name": "Rownak Islam",
+          "title": "Engineering Manager at Stripe - LinkedIn",
+          "score": 0.8,
+          "source": "likely_manager",
+          "warm": 1
+        },
+        {
+          "name": "Lindsay Brown",
+          "title": "Stripe - LinkedIn",
+          "score": 0.8,
+          "source": "recruiter",
+          "warm": 1
+        },
+        {
+          "name": "Alicia Tay",
+          "title": "Recruiting at Stripe! - LinkedIn",
+          "score": 0.8,
+          "source": "general",
+          "warm": 1
+        }
+      ],
+      "duration_s": 143.9
+    }
+  },
+  {
+    "test_case_id": "stripe_intern",
+    "test_case_label": "Stripe SWE Intern",
+    "stage_label": "apollo_integration",
+    "timestamp": "2026-03-20T04:55:12.144390+00:00",
+    "metrics": {
+      "total": 8,
+      "avg_score": 0.838,
+      "avg_influence": 0.8,
+      "avg_reachability": 0.862,
+      "max_score": 0.92,
+      "with_warm_signals": 3,
+      "with_github": 0,
+      "by_source": {
+        "general": 2,
+        "recruiter": 4,
+        "likely_manager": 2
+      },
+      "by_category": {
+        "general": 2,
+        "recruiter": 4,
+        "team_member": 1,
+        "hiring_manager": 1
+      },
+      "score_bands": {
+        "0.0-0.5": 0,
+        "0.5-0.6": 0,
+        "0.6-0.7": 0,
+        "0.7-0.8": 2,
+        "0.8+": 6
+      },
+      "top3": [
+        {
+          "name": "Amy Salazar",
+          "title": "Recruiting @ Stripe",
+          "score": 0.92,
+          "source": "general",
+          "warm": 1
+        },
+        {
+          "name": "Lindsay Brown",
+          "title": "Stripe - LinkedIn",
+          "score": 0.92,
+          "source": "recruiter",
+          "warm": 1
+        },
+        {
+          "name": "Sam Purcell",
+          "title": "Staff Software Engineer at Stripe",
+          "score": 0.7,
+          "source": "likely_manager",
+          "warm": 0
+        }
+      ],
+      "duration_s": 120.1
+    }
+  }
+]

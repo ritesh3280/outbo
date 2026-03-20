@@ -106,6 +106,13 @@ Job posting:
             "email_domain": data.get("email_domain") or _extract_email_domain_from_text(content),
             "reporting_to": data.get("reporting_to") or "",
         }
+
+        # Extract #LI- recruiter tags from raw posting text (ATS-syndicated LinkedIn tags)
+        li_tags = re.findall(r'#LI-([A-Z]{2}\d*)', content)
+        out["recruiter_tags"] = list(set(li_tags))
+        if out["recruiter_tags"]:
+            logger.info("Found #LI recruiter tags: %s", out["recruiter_tags"])
+
         # Validate hiring_manager is a person's name, not a job title
         hm = out["hiring_manager"]
         if hm:
@@ -192,6 +199,7 @@ def _empty_job_context() -> JobContext:
         "posting_date": "",
         "email_domain": "",
         "reporting_to": "",
+        "recruiter_tags": [],
     }
 
 
@@ -242,6 +250,38 @@ def _parse_reporting_to(reporting_to: str) -> tuple[str, str]:
     return (role_title, team_name)
 
 
+def _normalize_department(department: str) -> str:
+    """Normalize department names to produce valid manager titles."""
+    _DEPT_MAP = {
+        "engineering": "Engineering",
+        "product": "Product Engineering",  # "Product Manager" is an IC role
+        "data": "Data Engineering",
+        "design": "Design",
+        "security": "Security Engineering",
+        "devops": "DevOps",
+        "platform": "Platform Engineering",
+        "infrastructure": "Infrastructure",
+        "internship": "Engineering",       # not a real department
+        "": "Engineering",
+    }
+    return _DEPT_MAP.get(department.lower().strip(), department.capitalize())
+
+
+def _infer_manager_titles(seniority: str, department: str) -> list[str]:
+    """Infer what the hiring manager's title likely is based on role seniority."""
+    dept = _normalize_department(department)
+    seniority = seniority.lower()
+
+    if seniority in ("intern", "junior"):
+        return [f"{dept} Manager", "Tech Lead"]
+    elif seniority == "mid":
+        return [f"Senior {dept} Manager", f"Director of {dept}"]
+    elif seniority == "senior":
+        return [f"Director of {dept}", f"VP of {dept}"]
+    else:
+        return [f"{dept} Manager", "Tech Lead"]
+
+
 # ── Dynamic, tiered query builder ─────────────────────────────────────────
 
 
@@ -259,6 +299,7 @@ def build_search_queries(
     user_profile: "UserProfile | None" = None,
     job_url: str | None = None,
     role_keyword: str = "engineer",
+    careers_job_count: int | None = None,
 ) -> list[QueryGroup]:
     """Build prioritized, tiered Serper queries based on all available context.
 
@@ -296,6 +337,12 @@ def build_search_queries(
             category="job_posting_sharer",
             priority=1,
         ))
+        # Search LinkedIn posts (people share jobs as posts, not on profiles)
+        queries.append(QueryGroup(
+            query=f'site:linkedin.com/posts "{company}" "{title_for_search}" "hiring" OR "we\'re hiring" OR "join"',
+            category="job_posting_sharer",
+            priority=1,
+        ))
 
     if hiring_manager:
         queries.append(QueryGroup(
@@ -329,6 +376,36 @@ def build_search_queries(
                 category="reporting_manager",
                 priority=1,
             ))
+
+    # ── TIER 1c: Inferred hiring manager (when no explicit manager or reporting_to) ──
+    if not hiring_manager and not reporting_to:
+        seniority_val = jc.get("seniority", "") or ""
+        dept = jc.get("department", "") or "engineering"
+        inferred_titles = _infer_manager_titles(seniority_val, dept)
+        if inferred_titles:
+            for title in inferred_titles[:2]:
+                queries.append(QueryGroup(
+                    query=f'site:linkedin.com/in "at {company}" "{title}"',
+                    category="likely_manager",
+                    priority=2,
+                ))
+
+    # ── TIER 1d: #LI- recruiter tag queries (ATS-assigned recruiter) ──
+    recruiter_tags = jc.get("recruiter_tags", [])
+    if recruiter_tags:
+        # Search for the tag itself — sometimes visible on recruiter profiles/activity
+        for tag in recruiter_tags[:1]:  # cap at 1 to save query budget
+            queries.append(QueryGroup(
+                query=f'"#LI-{tag}" site:linkedin.com "{company}"',
+                category="job_posting_recruiter",
+                priority=1,
+            ))
+        # Promoted recruiter search — the tag confirms a recruiter is assigned to this job
+        queries.append(QueryGroup(
+            query=f'site:linkedin.com/in "at {company}" "recruiter" OR "talent acquisition"',
+            category="job_posting_recruiter",
+            priority=1,
+        ))
 
     # ── TIER 2: Team-specific ─────────────────────────────────────────
     # Prefer keywords and tech stack (which appear on LinkedIn) over internal team names
@@ -392,6 +469,13 @@ def build_search_queries(
                 priority=3,
             ))
 
+    # ── TIER 3b: Recently joined employees (high reachability) ────────
+    queries.append(QueryGroup(
+        query=f'site:linkedin.com/in "at {company}" "joined" OR "started" 2025 OR 2026 engineer OR developer',
+        category="team_search",
+        priority=3,
+    ))
+
     # ── TIER 4: Broad role match ──────────────────────────────────────
     tier4_kw = first_keyword if first_keyword and not first_keyword.startswith("http") else "engineer"
     queries.append(QueryGroup(
@@ -403,17 +487,22 @@ def build_search_queries(
     # ── TIER 2b: Intern-specific recruiter queries (promoted for intern roles) ──
     seniority = jc.get("seniority", "") or ""
     is_intern = seniority.lower() == "intern"
-    if is_intern:
+    is_small_company = careers_job_count is not None and careers_job_count < 10
+    if is_intern and not is_small_company:
         queries.append(QueryGroup(
-            query=f'site:linkedin.com/in "{company}" "university recruiter" OR "campus recruiter"',
+            query=f'site:linkedin.com/in "at {company}" "university recruiter" OR "campus recruiter"',
             category="recruiter",
             priority=2,
         ))
         queries.append(QueryGroup(
-            query=f'site:linkedin.com/in "{company}" "technical recruiter" "intern" OR "internship"',
+            query=f'site:linkedin.com/in "at {company}" "technical recruiter" "intern" OR "internship"',
             category="recruiter",
             priority=2,
         ))
+    elif is_intern and is_small_company:
+        logger.info(
+            "Skipping campus recruiter tier-2 queries — small company (~%d open role lines)", careers_job_count
+        )
 
     # ── TIER 5: Standard fallback (always included) ───────────────────
     queries.append(QueryGroup(
@@ -438,7 +527,7 @@ def build_search_queries(
     ))
 
     # ── Budget cap: sort by priority, keep top N (12 for intern, 10 otherwise) ──
-    cap = 12 if is_intern else 10
+    cap = 14 if is_intern else 12
     queries.sort(key=lambda q: q.priority)
     queries = queries[:cap]
 
@@ -448,3 +537,49 @@ def build_search_queries(
         ", ".join(sorted({str(q.priority) for q in queries})),
     )
     return queries
+
+
+# ── ATS public API for structured job counting ────────────────────────────
+
+
+async def count_jobs_via_ats(job_url: str) -> int | None:
+    """Use ATS public API to count open jobs. Returns None if ATS not detected or API fails."""
+    if not job_url:
+        return None
+
+    import httpx
+
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            # Lever: jobs.lever.co/{company}/...
+            lever_match = re.match(r'https?://jobs\.lever\.co/([^/]+)', job_url)
+            if lever_match:
+                company_slug = lever_match.group(1)
+                resp = await client.get(f"https://api.lever.co/v0/postings/{company_slug}?mode=json")
+                if resp.status_code == 200:
+                    return len(resp.json())
+
+            # Greenhouse: boards.greenhouse.io/{board_token}/...
+            gh_match = re.match(r'https?://(?:boards|job-boards)\.greenhouse\.io/([^/]+)', job_url)
+            if gh_match:
+                board_token = gh_match.group(1)
+                resp = await client.get(f"https://api.greenhouse.io/v1/boards/{board_token}/jobs")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    return len(data.get("jobs", []))
+
+            # Ashby: jobs.ashbyhq.com/{company}/...
+            ashby_match = re.match(r'https?://jobs\.ashbyhq\.com/([^/]+)', job_url)
+            if ashby_match:
+                company_slug = ashby_match.group(1)
+                resp = await client.get(
+                    f"https://api.ashbyhq.com/posting-api/job-board/{company_slug}",
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    jobs = data.get("jobs", data.get("jobPostings", []))
+                    return len(jobs) if isinstance(jobs, list) else None
+
+        except Exception as e:
+            logger.warning("ATS job count failed for %s: %s", job_url, e)
+    return None

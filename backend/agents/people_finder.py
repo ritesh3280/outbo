@@ -68,6 +68,9 @@ EXCLUDE_KEYWORDS = {
     "president", "vp", "vice president", "director", "head of",
     "chief", "partner", "general counsel", "controller",
     "cpa", "cfa", "board member",
+    "account executive",    # sales role, no hiring authority
+    "business development", # sales-adjacent at startups
+    "customer success",     # post-sale role, no hiring authority
 }
 
 EXCLUDE_DEPARTMENTS = {
@@ -157,19 +160,50 @@ def select_final_contacts(
     # Warm signals can exempt from the full threshold, but contacts must still
     # meet a minimum floor (influence > 0 or score >= 0.40) to avoid wasting
     # slots on zero-influence unknowns who merely share a university.
-    qualified = []
-    for p in scored_people:
-        if p.priority_score >= QUALITY_THRESHOLD:
-            qualified.append(p)
-        elif p.warm_signals and (p.influence_score > 0 or p.priority_score >= 0.40):
-            qualified.append(p)
+    #
+    # Adaptive: if the pool is small, relax the threshold in steps so we always
+    # return at least MIN_DESIRED contacts.
+    MIN_DESIRED = 6
+    MIN_FLOOR = 4
+    SUPPLEMENT_MIN_SCORE = 0.30
+
+    def _apply_threshold(threshold: float) -> list[Person]:
+        result = []
+        for p in scored_people:
+            if p.priority_score >= threshold:
+                result.append(p)
+            elif p.warm_signals and (p.influence_score > 0 or p.priority_score >= 0.40):
+                result.append(p)
+        return result
+
+    qualified = _apply_threshold(QUALITY_THRESHOLD)
+
+    # Adaptive relaxation: if fewer than MIN_DESIRED pass, drop threshold to 0.50
+    effective_threshold = QUALITY_THRESHOLD
+    if len(qualified) < MIN_DESIRED and QUALITY_THRESHOLD > 0.50:
+        relaxed = _apply_threshold(0.50)
+        if len(relaxed) > len(qualified):
+            logger.info(
+                "Adaptive threshold: only %d passed %.2f — relaxing to 0.50 → %d candidates",
+                len(qualified), QUALITY_THRESHOLD, len(relaxed),
+            )
+            qualified = relaxed
+            effective_threshold = 0.50
+
     if not qualified:
-        qualified = scored_people[:3]  # edge case: keep top 3 regardless
+        qualified = scored_people[:MIN_FLOOR]
+    elif len(qualified) < MIN_FLOOR:
+        existing_names = {p.name for p in qualified}
+        supplements = [
+            p for p in scored_people
+            if p.name not in existing_names and p.priority_score >= SUPPLEMENT_MIN_SCORE
+        ]
+        qualified.extend(supplements[:MIN_FLOOR - len(qualified)])
 
     dropped = [p for p in scored_people if p not in qualified]
     logger.info(
-        "Quality threshold: %d/%d passed (threshold=%.2f)",
-        len(qualified), len(scored_people), QUALITY_THRESHOLD,
+        "Quality threshold: %d/%d passed (effective threshold=%.2f)",
+        len(qualified), len(scored_people), effective_threshold,
     )
     for p in dropped:
         logger.info("  Dropped: %s (score=%.2f, no warm signals)", p.name, p.priority_score)
@@ -267,8 +301,36 @@ class PeopleFinder:
 
     @staticmethod
     def _parse_linkedin_from_serper(result, category: str = "general") -> LinkedInPerson | None:
-        """Parse one Serper organic result into LinkedInPerson if it's a LinkedIn profile."""
+        """Parse one Serper organic result into LinkedInPerson if it's a LinkedIn profile or post."""
         link = (result.link or "").strip()
+
+        # ── Handle LinkedIn post URLs → extract author's profile URL ──
+        if "linkedin.com/posts/" in link or "linkedin.com/feed/" in link:
+            # Primary format: linkedin.com/posts/{username}_{activity-hash}
+            post_match = re.search(r'linkedin\.com/posts/([a-zA-Z0-9-]+?)_', link)
+            if not post_match:
+                return None  # feed/update format or unparseable — skip
+            author_slug = post_match.group(1)
+            profile_url = f"https://www.linkedin.com/in/{author_slug}"
+            title_raw = (result.title or "").strip()
+            snippet = (result.snippet or "").strip()
+            # Try URL slug first (most reliable), then Serper title
+            name = _extract_name_from_linkedin_url(profile_url)
+            if not name:
+                # Serper title for posts: "FirstName LastName on LinkedIn: ..."
+                name = title_raw.split(" on LinkedIn")[0].strip()
+            if not name:
+                return None
+            return LinkedInPerson(
+                name=name,
+                title="",  # post doesn't give current title
+                linkedin_url=profile_url,
+                recent_activity=snippet,
+                discovery_source=category,
+                warm_signals=["shared_job_posting"],
+            )
+
+        # ── Handle LinkedIn profile URLs ──
         if "linkedin.com/in/" not in link:
             return None
         title_raw = (result.title or "").strip()
@@ -307,6 +369,7 @@ class PeopleFinder:
         user_profile: "UserProfile | None" = None,
         job_url: str | None = None,
         seed_candidates: list[dict] | None = None,
+        careers_job_count: int | None = None,
     ) -> list[LinkedInPerson]:
         """Run dynamic tiered Serper queries concurrently, return aggregated LinkedIn profiles."""
         team_keyword = self._extract_team_keyword(role)
@@ -316,6 +379,7 @@ class PeopleFinder:
             user_profile=user_profile,
             job_url=job_url,
             role_keyword=team_keyword,
+            careers_job_count=careers_job_count,
         )
 
         # Inject seed candidates from team page scraping as tier-1 queries (cap at 3)
@@ -446,6 +510,43 @@ class PeopleFinder:
 
         return people
 
+    # ── Pre-validation heuristic filter ──────────────────────────────
+
+    @staticmethod
+    def _heuristic_false_positive(person: LinkedInPerson, company: str) -> bool:
+        """Deterministically detect obvious false positives before spending LLM calls.
+
+        Returns True if the person is almost certainly NOT an employee of company.
+        Two heuristics:
+          2a — Name-match: for short company names (≤6 chars), reject if any name token
+               exactly equals the company name (catches "Ivo Moreno" for company "Ivo").
+          2b — Title company mismatch: extract "at [Company]" from the title; if the
+               extracted company clearly differs from our target, reject.
+        """
+        # 2a: Name-match for short/ambiguous company names
+        if len(company) <= 6:
+            name_tokens = {t.lower() for t in person.name.split()}
+            if company.lower() in name_tokens:
+                return True
+
+        # 2b: Title contains explicit "at [OtherCompany]"
+        match = re.search(
+            r'\bat\s+([a-zA-Z][a-zA-Z0-9\s&.]+?)(?:\s*[-–|,]|\s*$)',
+            person.title,
+            re.IGNORECASE,
+        )
+        if match:
+            title_company = match.group(1).strip()
+            # Skip if too short or purely punctuation (truncated LinkedIn snippet artifact)
+            if len(title_company) < 2 or not re.search(r'[a-zA-Z]', title_company):
+                return False
+            # Reject if the extracted company doesn't match our target (simple substring check)
+            if (title_company.lower() not in company.lower()
+                    and company.lower() not in title_company.lower()):
+                return True
+
+        return False
+
     # ── Validation ───────────────────────────────────────────────────
 
     async def _validate_person_works_at_company(
@@ -502,6 +603,19 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
         self, people: list[LinkedInPerson], company: str
     ) -> list[LinkedInPerson]:
         """Filter out false positives and tag recency using OpenAI validation."""
+        if not people:
+            return []
+
+        # Heuristic pre-filter: deterministically remove obvious false positives
+        pre_filtered = [p for p in people if not self._heuristic_false_positive(p, company)]
+        fp_count = len(people) - len(pre_filtered)
+        if fp_count:
+            logger.info(
+                "Pre-validation heuristic removed %d/%d obvious false positives",
+                fp_count, len(people),
+            )
+        people = pre_filtered
+
         if not people:
             return []
 
@@ -566,6 +680,36 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
         if gh_count:
             logger.info("GitHub: %d/%d candidates have public GitHub profiles", gh_count, len(non_recruiters))
 
+    # ── GitHub org candidates ─────────────────────────────────────────
+
+    @staticmethod
+    async def _fetch_github_org_candidates(company: str) -> list[LinkedInPerson]:
+        """Fetch GitHub org public members and convert to LinkedInPerson.
+
+        These candidates are already verified (org membership = employment),
+        so they bypass the OpenAI validation step.  Their bio is used as a
+        title hint; they enter the pipeline tagged as 'github_org'.
+        """
+        try:
+            from backend.tools.github_org import fetch_github_org_members
+            members = await fetch_github_org_members(company)
+            result: list[LinkedInPerson] = []
+            for m in members:
+                # Use bio as title hint (scorer will interpret it).
+                # Fall back to empty string — better than a fabricated title.
+                title_hint = m["bio"][:150] if m["bio"] else ""
+                result.append(LinkedInPerson(
+                    name=m["name"],
+                    title=title_hint,
+                    linkedin_url="",
+                    recent_activity=m["github_url"],
+                    discovery_source="github_org",
+                ))
+            return result
+        except Exception as e:
+            logger.warning("GitHub org fetch failed for %s: %s", company, e)
+            return []
+
     # ── Main pipeline ────────────────────────────────────────────────
 
     @staticmethod
@@ -586,6 +730,8 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
         user_profile: "UserProfile | None" = None,
         job_url: str | None = None,
         seed_candidates: list[dict] | None = None,
+        careers_job_count: int | None = None,
+        company_domain: str | None = None,
     ) -> list[Person]:
         """Find relevant people at a company for a given role.
 
@@ -601,6 +747,9 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
             user_profile: Optional UserProfile for warm-path matching.
             job_url: Optional job posting URL for tier-1 queries.
             seed_candidates: Optional list of {name, title} dicts from team page scraping.
+            careers_job_count: Rough count of open job lines from careers page (used to skip
+                campus recruiter queries for small companies with < 10 open roles).
+            company_domain: Optional company domain (e.g. "stripe.com") for Apollo search.
         """
         exclude = set()
         if exclude_linkedin_urls:
@@ -609,7 +758,7 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
                 if n:
                     exclude.add(n)
         if settings.serper_api_key:
-            return await self._find_people_serper(company, role, target_count, job_context, exclude, user_profile, job_url, seed_candidates)
+            return await self._find_people_serper(company, role, target_count, job_context, exclude, user_profile, job_url, seed_candidates, careers_job_count, company_domain)
         return await self._find_people_browser(company, role, target_count, job_context, exclude, user_profile)
 
     async def _find_people_serper(
@@ -622,11 +771,31 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
         user_profile: "UserProfile | None" = None,
         job_url: str | None = None,
         seed_candidates: list[dict] | None = None,
+        careers_job_count: int | None = None,
+        company_domain: str | None = None,
     ) -> list[Person]:
         """Wide-net pipeline: dynamic queries → hard filter → warm signals → validation → scoring → diversity selection."""
-        all_people = await self.search_serper_wide(company, role, job_context, user_profile, job_url, seed_candidates)
+        # ── Run Serper + GitHub org concurrently ───────────────────────
+        serper_coro = self.search_serper_wide(
+            company, role, job_context, user_profile, job_url, seed_candidates, careers_job_count
+        )
+        github_coro = self._fetch_github_org_candidates(company)
+        serper_people, github_people = await asyncio.gather(serper_coro, github_coro)
+
+        # Merge: Serper first so LinkedIn-URL-bearing records take dedup precedence.
+        if github_people:
+            logger.info("GitHub org: %d member candidates to merge", len(github_people))
+            all_people = self._deduplicate(serper_people + github_people)
+            gh_new = sum(1 for p in all_people if p.discovery_source == "github_org")
+            logger.info(
+                "After merge + dedup: %d unique (%d GitHub new)",
+                len(all_people), gh_new,
+            )
+        else:
+            all_people = serper_people
+
         if not all_people:
-            logger.warning("Serper returned no candidates for %s", company)
+            logger.warning("No candidates found for %s", company)
             return []
 
         if exclude_urls:
@@ -644,13 +813,22 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
         # Cross-reference warm signals before validation
         all_people = self._cross_reference_warm_signals(all_people, user_profile)
 
-        all_people = await self._filter_valid_people(all_people, company)
-        logger.info("After validation: %d confirmed employees", len(all_people))
+        # GitHub org candidates are already verified (org membership = confirmed employment).
+        # Validate only non-GitHub candidates to avoid wasting LLM calls + false-negatives.
+        github_verified = [p for p in all_people if p.discovery_source == "github_org"]
+        to_validate = [p for p in all_people if p.discovery_source != "github_org"]
+        validated = await self._filter_valid_people(to_validate, company)
+        all_people = validated + github_verified
+        logger.info(
+            "After validation: %d confirmed (%d validated + %d GitHub-verified)",
+            len(all_people), len(validated), len(github_verified),
+        )
         if not all_people:
             return []
 
-        people = [
-            Person(
+        people: list[Person] = []
+        for lp in all_people:
+            people.append(Person(
                 name=lp.name,
                 title=lp.title,
                 company=company,
@@ -659,13 +837,14 @@ Return JSON only: {{"works_here": "yes" or "no", "recency": "active" or "stale" 
                 profile_summary=lp.recent_activity,
                 discovery_source=lp.discovery_source,
                 warm_signals=lp.warm_signals,
-            )
-            for lp in all_people
-        ]
+                has_public_github=(lp.discovery_source == "github_org"),
+            ))
 
         # ── GitHub presence check (before scoring so scorer can factor it in) ──
-        # Only for engineers/managers (not recruiters). Respects rate limits.
-        await self._check_github_presence_batch(people, company)
+        # Only for Serper-sourced engineers/managers; GitHub org members already set above.
+        await self._check_github_presence_batch(
+            [p for p in people if p.discovery_source != "github_org"], company
+        )
 
         logger.info("Scoring %d people (dual-axis: influence + reachability)...", len(people))
         scored = await score_people(people, role, company, job_context=job_context)

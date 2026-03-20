@@ -598,6 +598,7 @@ class EmailFinder:
         job_posting_domain: str = "",
     ) -> EmailResult:
         """Find the email for a single person."""
+
         first, last = parse_name(person.name)
 
         if not first:
@@ -637,6 +638,31 @@ class EmailFinder:
                 confidence=EmailConfidence.LOW,
                 source="Could not generate patterns",
             )
+
+        # Step 2.5: Apollo CRM verification — try top patterns for free
+        if settings.apollo_api_key:
+            try:
+                from backend.tools.apollo import verify_email_patterns
+                verified_email, _ = await verify_email_patterns(
+                    first_name=first.capitalize(),
+                    last_name=last.capitalize() if last else "",
+                    organization_name=person.company,
+                    domain=domain,
+                    patterns=patterns,
+                    max_attempts=3,
+                )
+                if verified_email:
+                    alt = [p for p in patterns if p != verified_email][:2]
+                    logger.info("Apollo CRM verified: %s → %s", person.name, verified_email)
+                    return EmailResult(
+                        name=person.name,
+                        email=verified_email,
+                        confidence=EmailConfidence.HIGH,
+                        source="Apollo CRM verified",
+                        alternative_emails=alt,
+                    )
+            except Exception as e:
+                logger.debug("Apollo CRM verification failed for %s: %s", person.name, e)
 
         # Assign confidence based on what we know
         if detected_pattern:

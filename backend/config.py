@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     # GitHub (optional — increases API rate limit from 10 to 60 req/min)
     github_token: str = ""
 
+    # Apollo.io (master API key — People Search is FREE, Enrichment costs credits)
+    apollo_api_key: str = ""
+
     # AgentMail
     agentmail_api_key: str = ""
 

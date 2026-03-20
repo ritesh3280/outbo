@@ -1,10 +1,12 @@
 import logging
+import logging.handlers
+import os
 import uuid
 from contextlib import asynccontextmanager
 
 from datetime import datetime, timezone
 
-from fastapi import BackgroundTasks, FastAPI, HTTPException, Response, WebSocket, WebSocketDisconnect
+from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Response, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 
 # ── Configure logging so all backend.* logger.info() calls print to terminal ──
@@ -13,6 +15,23 @@ logging.basicConfig(
     format="\033[90m%(asctime)s\033[0m %(levelname)s \033[1m%(name)s\033[0m  %(message)s",
     datefmt="%H:%M:%S",
 )
+
+# ── Also write logs to disk (no ANSI colors) — rotates daily, keeps 30 days ──
+_logs_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs")
+os.makedirs(_logs_dir, exist_ok=True)
+_file_handler = logging.handlers.TimedRotatingFileHandler(
+    filename=os.path.join(_logs_dir, "outreach.log"),
+    when="midnight",
+    backupCount=30,
+    encoding="utf-8",
+)
+_file_handler.setLevel(logging.INFO)
+_file_handler.setFormatter(logging.Formatter(
+    fmt="%(asctime)s %(levelname)s %(name)s  %(message)s",
+    datefmt="%H:%M:%S",
+))
+logging.getLogger().addHandler(_file_handler)
+
 # Quiet noisy third-party loggers
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
@@ -31,6 +50,11 @@ from backend.db.mongodb import (
     get_profile as db_get_profile,
     save_profile as db_save_profile,
     delete_profile as db_delete_profile,
+    save_resume as db_save_resume,
+    list_resumes as db_list_resumes,
+    get_resume_file as db_get_resume_file,
+    get_resume_text as db_get_resume_text,
+    delete_resume as db_delete_resume,
 )
 
 # In-memory fallback when MongoDB is not configured
@@ -116,8 +140,11 @@ async def save_user_profile(profile: UserProfileDoc):
     doc["profile_id"] = "default"
     doc["updated_at"] = now
     existing = await _get_profile("default")
-    if existing and existing.get("created_at"):
-        doc["created_at"] = existing["created_at"]
+    if existing:
+        doc["created_at"] = existing.get("created_at") or now
+        # Preserve active_resume_id if not explicitly set in this save
+        if not doc.get("active_resume_id") and existing.get("active_resume_id"):
+            doc["active_resume_id"] = existing["active_resume_id"]
     else:
         doc["created_at"] = now
     await _save_profile(doc)
@@ -128,6 +155,77 @@ async def save_user_profile(profile: UserProfileDoc):
 async def delete_user_profile():
     """Delete the user profile."""
     await _delete_profile("default")
+    return {"status": "deleted"}
+
+
+@app.post("/api/profile/resumes")
+async def upload_resume(file: UploadFile = File(...)):
+    """Upload a PDF resume. Stores the file and extracted text; returns the new resume metadata."""
+    if not file.filename or not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+    try:
+        import io, uuid
+        from pypdf import PdfReader
+
+        content = await file.read()
+        reader = PdfReader(io.BytesIO(content))
+        pages_text = [p for page in reader.pages if (p := page.extract_text())]
+        raw_text = "\n".join(pages_text).strip()
+
+        if not raw_text:
+            raise HTTPException(status_code=422, detail="Could not extract text — is it a scanned image?")
+
+        resume_id = str(uuid.uuid4())
+        filename = file.filename or "resume.pdf"
+        now = datetime.now(timezone.utc).isoformat()
+
+        await db_save_resume(resume_id, "default", content, filename, raw_text)
+
+        logging.getLogger(__name__).info(
+            "Resume uploaded: %s id=%s %d bytes %d chars", filename, resume_id, len(content), len(raw_text)
+        )
+        return {
+            "resume_id": resume_id,
+            "filename": filename,
+            "size": len(content),
+            "uploaded_at": now,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logging.getLogger(__name__).error("Resume upload failed: %s", e)
+        raise HTTPException(status_code=500, detail=f"Resume upload failed: {e}")
+
+
+@app.get("/api/profile/resumes")
+async def list_resumes():
+    """List all uploaded resumes (metadata only, no PDF bytes)."""
+    return await db_list_resumes("default")
+
+
+@app.get("/api/profile/resumes/{resume_id}")
+async def download_resume(resume_id: str):
+    """Download a specific resume PDF."""
+    resume = await db_get_resume_file(resume_id)
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found")
+    return Response(
+        content=resume["pdf"],
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{resume["filename"]}"'},
+    )
+
+
+@app.delete("/api/profile/resumes/{resume_id}")
+async def delete_resume(resume_id: str):
+    """Delete a resume. Also clears active_resume_id if it pointed to this one."""
+    await db_delete_resume(resume_id)
+    # Clear from profile if it was the active one
+    existing = await _get_profile("default")
+    if existing and existing.get("active_resume_id") == resume_id:
+        existing["active_resume_id"] = ""
+        existing["updated_at"] = datetime.now(timezone.utc).isoformat()
+        await _save_profile(existing)
     return {"status": "deleted"}
 
 

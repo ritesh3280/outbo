@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 
 COLLECTION_JOBS = "jobs"
 COLLECTION_PROFILES = "profiles"
+COLLECTION_RESUMES = "resumes"
 
 _client: Optional[AsyncIOMotorClient] = None
 _db: Optional[AsyncIOMotorDatabase] = None
@@ -162,3 +163,94 @@ async def delete_profile(profile_id: str) -> None:
         await db[COLLECTION_PROFILES].delete_one({"_id": profile_id})
     except Exception as e:
         logger.warning("delete_profile failed for %s: %s", profile_id, e)
+
+
+# ── Resume file storage (multiple resumes per profile) ───────────────────
+
+
+async def save_resume(resume_id: str, profile_id: str, pdf_bytes: bytes, filename: str, text: str) -> None:
+    """Store a resume with its extracted text. No-op if MongoDB not connected."""
+    from datetime import datetime, timezone
+    db = get_db()
+    if db is None:
+        return
+    try:
+        doc = {
+            "_id": resume_id,
+            "profile_id": profile_id,
+            "pdf": pdf_bytes,
+            "filename": filename,
+            "size": len(pdf_bytes),
+            "text": text,
+            "uploaded_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db[COLLECTION_RESUMES].replace_one({"_id": resume_id}, doc, upsert=True)
+        logger.info("Resume saved: %s (%d bytes, %d chars)", filename, len(pdf_bytes), len(text))
+    except Exception as e:
+        logger.warning("save_resume failed: %s", e)
+
+
+async def list_resumes(profile_id: str) -> list[dict]:
+    """List resume metadata for a profile (no PDF bytes). Returns [] if DB not connected."""
+    db = get_db()
+    if db is None:
+        return []
+    try:
+        cursor = db[COLLECTION_RESUMES].find(
+            {"profile_id": profile_id},
+            {"pdf": 0},  # exclude binary field
+        ).sort("uploaded_at", -1)
+        results = []
+        async for doc in cursor:
+            results.append({
+                "resume_id": doc["_id"],
+                "filename": doc.get("filename", "resume.pdf"),
+                "size": doc.get("size", 0),
+                "uploaded_at": doc.get("uploaded_at", ""),
+            })
+        return results
+    except Exception as e:
+        logger.warning("list_resumes failed: %s", e)
+        return []
+
+
+async def get_resume_file(resume_id: str) -> dict | None:
+    """Load resume PDF bytes. Returns {pdf, filename} or None."""
+    db = get_db()
+    if db is None:
+        return None
+    try:
+        doc = await db[COLLECTION_RESUMES].find_one({"_id": resume_id})
+        if not doc:
+            return None
+        return {"pdf": doc["pdf"], "filename": doc.get("filename", "resume.pdf")}
+    except Exception as e:
+        logger.warning("get_resume_file failed: %s", e)
+        return None
+
+
+async def get_resume_text(resume_id: str) -> str:
+    """Load only the extracted text for a resume. Returns '' if not found."""
+    db = get_db()
+    if db is None:
+        return ""
+    try:
+        doc = await db[COLLECTION_RESUMES].find_one({"_id": resume_id}, {"text": 1})
+        if not doc:
+            return ""
+        return doc.get("text", "")
+    except Exception as e:
+        logger.warning("get_resume_text failed: %s", e)
+        return ""
+
+
+async def delete_resume(resume_id: str) -> None:
+    """Delete a resume. No-op if MongoDB not connected."""
+    db = get_db()
+    if db is None:
+        return
+    try:
+        await db[COLLECTION_RESUMES].delete_one({"_id": resume_id})
+        logger.info("Resume deleted: %s", resume_id)
+    except Exception as e:
+        logger.warning("delete_resume failed: %s", e)

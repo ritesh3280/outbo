@@ -1,0 +1,57 @@
+{
+  "test_case_id": "stripe_intern",
+  "test_case_label": "Stripe SWE Intern",
+  "stage_label": "apollo_integration",
+  "timestamp": "2026-03-20T04:55:12.144390+00:00",
+  "metrics": {
+    "total": 8,
+    "avg_score": 0.838,
+    "avg_influence": 0.8,
+    "avg_reachability": 0.862,
+    "max_score": 0.92,
+    "with_warm_signals": 3,
+    "with_github": 0,
+    "by_source": {
+      "general": 2,
+      "recruiter": 4,
+      "likely_manager": 2
+    },
+    "by_category": {
+      "general": 2,
+      "recruiter": 4,
+      "team_member": 1,
+      "hiring_manager": 1
+    },
+    "score_bands": {
+      "0.0-0.5": 0,
+      "0.5-0.6": 0,
+      "0.6-0.7": 0,
+      "0.7-0.8": 2,
+      "0.8+": 6
+    },
+    "top3": [
+      {
+        "name": "Amy Salazar",
+        "title": "Recruiting @ Stripe",
+        "score": 0.92,
+        "source": "general",
+        "warm": 1
+      },
+      {
+        "name": "Lindsay Brown",
+        "title": "Stripe - LinkedIn",
+        "score": 0.92,
+        "source": "recruiter",
+        "warm": 1
+      },
+      {
+        "name": "Sam Purcell",
+        "title": "Staff Software Engineer at Stripe",
+        "score": 0.7,
+        "source": "likely_manager",
+        "warm": 0
+      }
+    ],
+    "duration_s": 120.1
+  }
+}

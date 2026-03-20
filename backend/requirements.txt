@@ -3,6 +3,7 @@ uvicorn[standard]
 pydantic
 pydantic-settings
 python-dotenv
+python-multipart
 websockets
 openai
 httpx
@@ -12,3 +13,4 @@ dnspython
 langfuse
 motor
 certifi
+pypdf
