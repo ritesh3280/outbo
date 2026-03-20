@@ -306,24 +306,99 @@ def _guess_domain(company: str) -> str:
 # ── Step 4.2: Single Email Generation ────────────────────────────────────
 
 
-SINGLE_EMAIL_SYSTEM_PROMPT = """You write cold outreach emails from a student applying for jobs/internships.
+async def _enrich_recipient(person: Person) -> str:
+    """Serper lookup to get recipient's education/background from LinkedIn snippet.
 
-Rules:
-- 5-7 sentences. No more, no less.
-- Sign off with the sender's actual name from "Sender name:" in the prompt. Never invent or assume a name.
-- First sentence: ONE specific thing about the RECIPIENT — their role, a project their team ships, or something from their LinkedIn. Not "I came across your profile."
-- Middle: 1-2 sentences about the sender — school, relevant skills, and ONE concrete thing they've built or done. Be specific, not generic.
-- Closing: a clear, low-friction ask. Either a 15-min chat, advice on the role, or (for engineers) subtly mention a referral if they think you'd be a fit.
-- No hollow phrases: "I was impressed by", "I hope this finds you well", "I'd love to learn more about your journey", "I came across your profile".
-- Write like a real person, not a cover letter. Conversational but professional.
+    If we already have a decent profile_summary, skip. Otherwise do a quick search
+    so we have real facts (school, previous companies, etc.) to personalize with.
+    """
+    if person.profile_summary and len(person.profile_summary) > 150:
+        return person.profile_summary
 
-Tone by recipient type:
-- Recruiter: name the exact role title, keep it direct.
-- Engineer: lead with shared tech or something specific about what they build. Casual referral mention is fine.
-- Manager: show you understand what their team is responsible for.
+    try:
+        from backend.tools.serper import search as serper_search
+        query = f'"{person.name}" "{person.company}" site:linkedin.com'
+        results = await serper_search(query, num=3)
+        snippets = []
+        for r in results:
+            if r.snippet:
+                snippets.append(r.snippet)
+        if snippets:
+            enriched = " | ".join(snippets[:2])
+            logger.info("Enriched recipient %s: %s", person.name, enriched[:120])
+            return enriched
+    except Exception as e:
+        logger.debug("Recipient enrichment failed for %s: %s", person.name, e)
+
+    return person.profile_summary or ""
+
+
+SINGLE_EMAIL_SYSTEM_PROMPT = """You write cold outreach emails from a college student to people at companies they applied to.
+
+FORMAT (follow exactly):
+
+Hi [First Name],
+
+[LINE 1: who you are (first name, school, year) + you applied for the role. Example: "I'm Ritesh, a CS junior at UMD — I applied for the SWE Intern role at Brex."]
+[LINE 2 (OPTIONAL): A fact about the recipient from RECIPIENT DATA only. Their school, previous company, or career path. Example: "Saw you came from Georgia Tech before joining Brex." If RECIPIENT DATA is just a name and title with no real background info, SKIP THIS LINE ENTIRELY. Do NOT guess.]
+[LINE 3-4: ONE project or experience from the sender's resume/background below. Use the EXACT name as it appears. Describe it in 1-2 short sentences — what it does, key tech. Then connect it to the company. Example: "At HackPrinceton, I built Orbital Finance — a voice AI platform for real-time crypto trading using Solana and RAG. The real-time data pipeline work feels close to what Brex handles with financial infrastructure."]
+[LINE 5: Clear ask. Example: "Would love to chat for 15 min about the team — and if you think I'd be a fit."]
+
+Thanks,
+[EXACT sender name from SENDER_NAME field]
+
+ABSOLUTE RULES:
+- ONLY use projects/experiences that appear in SENDER BACKGROUND (resume text). If the project name is not in the text, you are hallucinating. Stop.
+- ONLY mention facts about the recipient that appear in RECIPIENT DATA. If you cannot point to where you read it, you are hallucinating. Stop.
+- Sign off with the EXACT full name from SENDER_NAME. Not initials, not shortened, not a different name.
+- Do NOT include any URLs in the body.
+- 4-6 sentences max. No fluff.
+- BANNED: "I was impressed", "I hope this finds you well", "I came across your profile", "innovative solutions", "cutting-edge", "scalable solutions", "impactful"
 
 Return JSON only:
-{"subject": "...", "body": "...", "personalization_notes": "what specific detail you used to personalize"}"""
+{"subject": "...", "body": "...", "personalization_notes": "recipient fact used (or 'none'), project picked and why"}"""
+
+
+def _fix_signoff(body: str, name: str, linkedin: str, resume: str, portfolio: str) -> str:
+    """Post-process: force correct name in sign-off and always append links.
+
+    Finds the sign-off pattern (Thanks/Best/Cheers + name) and replaces whatever
+    name the LLM put with the correct one. Then appends links.
+    """
+    if not body.strip():
+        return body
+
+    lines = body.rstrip().split("\n")
+
+    # Find "Thanks," / "Best," / "Cheers," line and replace the name line after it
+    if name:
+        for i, line in enumerate(lines):
+            stripped = line.strip().rstrip(",").lower()
+            if stripped in ("thanks", "best", "best regards", "cheers", "thank you"):
+                # The next non-empty line should be the name — replace it
+                for j in range(i + 1, min(i + 3, len(lines))):
+                    if lines[j].strip():
+                        lines[j] = name
+                        break
+                else:
+                    # No name line found after sign-off — add it
+                    lines.insert(i + 1, name)
+                break
+
+    result = "\n".join(lines).rstrip()
+
+    # Append links
+    link_lines = []
+    if linkedin:
+        link_lines.append(linkedin)
+    if resume:
+        link_lines.append(resume)
+    if portfolio:
+        link_lines.append(portfolio)
+    if link_lines:
+        result += "\n\n" + "\n".join(link_lines)
+
+    return result
 
 
 async def generate_single_email(
@@ -335,39 +410,43 @@ async def generate_single_email(
     previous_openings: list[str] | None = None,
     job_context: dict | None = None,
 ) -> EmailDraft:
-    """Generate a personalized cold email for one contact.
-
-    Args:
-        person: The contact to email.
-        email_result: Their discovered email.
-        company_context: Research about the company.
-        role: The role being applied for.
-        user_info: Optional info about the sender (resume highlights, etc.).
-        previous_openings: Opening lines used in previous emails (for variety).
-
-    Returns:
-        EmailDraft with subject, body, and personalization notes.
-    """
+    """Generate a personalized cold email for one contact."""
     if not settings.openai_api_key:
         return EmailDraft(
             name=person.name,
             email=email_result.email,
             subject=f"Interested in {role} at {person.company}",
-            body=f"Hi {person.name.split()[0]},\n\nI'm reaching out about the {role} position at {person.company}. I'd love to learn more about the team and the role.\n\nWould you have 15 minutes for a quick chat?\n\nBest regards",
+            body=f"Hi {person.name.split()[0]},\n\nI'm reaching out about the {role} position at {person.company}.\n\nBest regards",
             tone="warm-professional",
-            personalization_notes="Stub mode — no OpenAI key",
+            personalization_notes="Stub — no OpenAI key",
         )
 
-    variety_instruction = ""
-    if previous_openings:
-        variety_instruction = (
-            f"\n\nIMPORTANT: Do NOT start the email with any of these openings "
-            f"(already used for other contacts at the same company):\n"
-            + "\n".join(f"- \"{o}\"" for o in previous_openings)
-            + "\nUse a completely different opening angle."
-        )
+    # ── Enrich recipient background ──────────────────────────────────
+    enriched_summary = await _enrich_recipient(person)
 
-    # Determine recipient type for tone
+    # ── Parse sender details from user_info ──────────────────────────
+    sender_name = ""
+    sender_linkedin = ""
+    sender_resume = ""
+    sender_portfolio = ""
+    for line in (user_info or "").split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("Sender name:"):
+            sender_name = stripped.split(":", 1)[1].strip()
+        elif stripped.startswith("LinkedIn URL:") or stripped.startswith("LinkedIn:"):
+            val = stripped.split(":", 1)[1].strip()
+            if val.startswith("http"):
+                sender_linkedin = val
+        elif stripped.startswith("Resume URL:") or stripped.startswith("Resume:"):
+            val = stripped.split(":", 1)[1].strip()
+            if val.startswith("http"):
+                sender_resume = val
+        elif stripped.startswith("Portfolio URL:") or stripped.startswith("Portfolio:"):
+            val = stripped.split(":", 1)[1].strip()
+            if val.startswith("http"):
+                sender_portfolio = val
+
+    # ── Recipient type ───────────────────────────────────────────────
     title_lower = person.title.lower()
     if any(kw in title_lower for kw in ["recruit", "talent", "hiring"]):
         recipient_type = "Recruiter"
@@ -376,37 +455,45 @@ async def generate_single_email(
     else:
         recipient_type = "Engineer"
 
-    job_block = ""
-    if job_context and any(job_context.get(k) for k in ("team", "tech_stack", "key_requirements")):
-        team = job_context.get("team", "")
-        tech = job_context.get("tech_stack", [])
-        reqs = job_context.get("key_requirements", [])
-        job_block = (
-            f"\nThe sender is applying for this specific role (use to make the email specific):\n"
-            f"- Team: {team}\n"
-            f"- Key tech: {tech}\n"
-            f"- What the role involves: {reqs}\n"
-            "For engineers, mention shared tech stack interest; you may mention the referral possibility as a reason to connect — but keep it casual, not transactional. "
-            "For recruiters, reference the exact posting. "
-            "For managers, show you understand what their team builds.\n\n"
+    # ── Variety instruction ──────────────────────────────────────────
+    variety_instruction = ""
+    if previous_openings:
+        variety_instruction = (
+            f"\n\nDo NOT start with any of these (already used):\n"
+            + "\n".join(f"- \"{o}\"" for o in previous_openings)
         )
 
+    # ── Job context ──────────────────────────────────────────────────
+    job_block = ""
+    if job_context and any(job_context.get(k) for k in ("team", "tech_stack", "key_requirements")):
+        job_block = (
+            f"Role details:\n"
+            f"- Team: {job_context.get('team', '')}\n"
+            f"- Tech stack: {job_context.get('tech_stack', [])}\n"
+            f"- Requirements: {job_context.get('key_requirements', [])}\n"
+        )
+
+    # ── Build prompt ─────────────────────────────────────────────────
     user_prompt = (
-        f"Write a cold outreach email.\n\n"
-        f"Sender is a student applying for {role} at {company_context.company}.\n"
-        f"Sender info (use 'Sender name' as the sign-off name — do not invent a different name):\n{user_info or 'Not provided'}\n\n"
-        f"Recipient: {person.name}, {person.title}\n"
-        f"Recipient type: {recipient_type}\n"
-        f"Their LinkedIn snippet: {person.profile_summary[:300] if person.profile_summary else 'Not available'}\n\n"
-        f"{job_block}"
-        f"Company context:\n"
-        f"- Mission: {company_context.mission}\n"
-        f"- Recent news: {company_context.recent_news}\n"
-        f"- Blog highlights: {company_context.blog_highlights}\n"
-        f"- Culture: {company_context.culture_notes}\n"
-        f"- Role info: {company_context.relevant_role_info}\n"
+        f"SENDER_NAME: {sender_name}\n\n"
+        f"RECIPIENT DATA:\n"
+        f"  Name: {person.name}\n"
+        f"  Title: {person.title} at {person.company}\n"
+        f"  LinkedIn/background: {enriched_summary or '(no data — do NOT invent their background)'}\n"
+        f"  Outreach angle: {person.outreach_angle or '(none)'}\n"
+        f"  Warm signals: {', '.join(person.warm_signals) if person.warm_signals else '(none)'}\n"
+        f"  Type: {recipient_type}\n\n"
+        f"SENDER BACKGROUND:\n{user_info or '(not provided)'}\n\n"
+        f"ROLE: {role} at {company_context.company} (sender has already applied)\n"
+        f"{job_block}\n"
+        f"COMPANY: {company_context.mission}\n"
+        f"News: {company_context.recent_news}\n"
+        f"Culture: {company_context.culture_notes}\n"
         f"{variety_instruction}"
     )
+
+    logger.info("Generating email for %s — enriched=%d chars, type=%s",
+                person.name, len(enriched_summary), recipient_type)
 
     client = AsyncOpenAI(api_key=settings.openai_api_key)
 
@@ -417,18 +504,22 @@ async def generate_single_email(
                 {"role": "system", "content": SINGLE_EMAIL_SYSTEM_PROMPT},
                 {"role": "user", "content": user_prompt},
             ],
-            temperature=0.8,
+            temperature=0.7,
             response_format={"type": "json_object"},
         )
 
         content = response.choices[0].message.content or ""
         data = json.loads(content)
+        body = data.get("body", "")
+
+        # ── Post-process: fix name and append links ──────────────────
+        body = _fix_signoff(body, sender_name, sender_linkedin, sender_resume, sender_portfolio)
 
         return EmailDraft(
             name=person.name,
             email=email_result.email,
-            subject=data.get("subject", f"Re: {role} at {person.company}"),
-            body=data.get("body", ""),
+            subject=data.get("subject", f"{role} at {person.company}"),
+            body=body,
             tone="warm-professional",
             personalization_notes=data.get("personalization_notes", ""),
         )
@@ -436,13 +527,21 @@ async def generate_single_email(
     except Exception as e:
         logger.error("Email generation failed for %s: %s", person.name, e)
         first_name = person.name.split()[0] if person.name else "there"
+        fallback_body = (
+            f"Hi {first_name},\n\n"
+            f"I'm {sender_name or 'a student'} — I just applied for the {role} "
+            f"position at {person.company} and wanted to reach out.\n\n"
+            f"Would you have 15 minutes for a quick chat about the team?\n\n"
+            f"Thanks,\n{sender_name or 'Best regards'}"
+        )
+        fallback_body = _fix_signoff(fallback_body, sender_name, sender_linkedin, sender_resume, sender_portfolio)
         return EmailDraft(
             name=person.name,
             email=email_result.email,
-            subject=f"Interested in {role} at {person.company}",
-            body=f"Hi {first_name},\n\nI'm reaching out about the {role} position at {person.company}. I'd love to learn more.\n\nWould you have 15 minutes for a quick chat?\n\nBest regards",
+            subject=f"{role} at {person.company}",
+            body=fallback_body,
             tone="warm-professional",
-            personalization_notes=f"Fallback template (generation failed: {e})",
+            personalization_notes=f"Fallback (generation failed: {e})",
         )
 
 

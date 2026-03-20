@@ -154,35 +154,46 @@ async def run_search(
             user_info_parts.append(f"Previous companies: {', '.join(saved_profile['previous_companies'])}")
         if saved_profile.get("skills"):
             user_info_parts.append(f"Skills: {', '.join(saved_profile['skills'])}")
-        if saved_profile.get("projects"):
-            proj_lines = []
-            for p in saved_profile["projects"]:
-                loc = f" ({p['location']})" if p.get("location") else ""
-                desc = f": {p['description']}" if p.get("description") else ""
-                proj_lines.append(f"- {p['name']}{loc}{desc}")
-            user_info_parts.append("Projects:\n" + "\n".join(proj_lines))
-        if saved_profile.get("work_experience"):
-            work_lines = []
-            for w in saved_profile["work_experience"]:
-                period = ""
-                if w.get("start_date"):
-                    end = w.get("end_date") or "present"
-                    period = f" ({w['start_date']}–{end})"
-                desc = f": {w['description']}" if w.get("description") else ""
-                work_lines.append(f"- {w['title']} at {w['company']}{period}{desc}")
-            user_info_parts.append("Work experience:\n" + "\n".join(work_lines))
         if saved_profile.get("linkedin_url"):
             user_info_parts.append(f"LinkedIn URL: {saved_profile['linkedin_url']}")
         if saved_profile.get("resume_url"):
             user_info_parts.append(f"Resume URL: {saved_profile['resume_url']}")
+        if saved_profile.get("portfolio_url"):
+            user_info_parts.append(f"Portfolio URL: {saved_profile['portfolio_url']}")
+        # Use resume text as the primary source of projects/experience info
+        # (replaces structured projects + work_experience to keep prompt natural and concise)
+        resume_text = ""
         if saved_profile.get("active_resume_id"):
             try:
                 from backend.db.mongodb import get_resume_text as _get_resume_text
                 resume_text = await _get_resume_text(saved_profile["active_resume_id"])
-                if resume_text:
-                    user_info_parts.append(f"Resume (full text):\n{resume_text[:4000]}")
             except Exception as _e:
                 logger.debug("Could not load resume text: %s", _e)
+        if resume_text:
+            user_info_parts.append(f"Resume:\n{resume_text[:5000]}")
+        else:
+            # Fallback: use structured projects/work if no resume uploaded
+            if saved_profile.get("projects"):
+                proj_lines = []
+                for p in saved_profile["projects"]:
+                    loc = f" ({p['location']})" if p.get("location") else ""
+                    raw_desc = p.get("description", "")
+                    short = raw_desc.split("\n")[0][:150] if raw_desc else ""
+                    desc = f": {short}" if short else ""
+                    proj_lines.append(f"- {p['name']}{loc}{desc}")
+                user_info_parts.append("Projects:\n" + "\n".join(proj_lines))
+            if saved_profile.get("work_experience"):
+                work_lines = []
+                for w in saved_profile["work_experience"]:
+                    period = ""
+                    if w.get("start_date"):
+                        end = w.get("end_date") or "present"
+                        period = f" ({w['start_date']}–{end})"
+                    raw_desc = w.get("description", "")
+                    short = raw_desc.split("\n")[0][:150] if raw_desc else ""
+                    desc = f": {short}" if short else ""
+                    work_lines.append(f"- {w['title']} at {w['company']}{period}{desc}")
+                user_info_parts.append("Work experience:\n" + "\n".join(work_lines))
 
     # Priority 2: Fall back to extraction from provided URLs
     elif request.linkedin_url or request.resume_url:
